@@ -3,7 +3,7 @@
 **Open-source POCSAG transceiver and DAPNET node firmware.**  
 Current target: **LilyGO T-Beam AXP2101 V1.2 / SX1278 433 MHz**.
 
-Firmware version **v0.6.9 by DM1PWN**.
+Firmware version **v0.7.0 by DM1PWN**.
 
 > PocketDAPNET is an independent amateur-radio project. It is not an official DAPNET or LilyGO product.
 
@@ -17,11 +17,11 @@ Firmware version **v0.6.9 by DM1PWN**.
 - Manual POCSAG transmission from the Web UI.
 - Separate RX and TX frequency correction and configurable SX1278 TX power.
 - WiFi station mode with automatic fallback access point.
-- Responsive Web UI with dashboard, separate settings, live status, message history and event debug log.
+- Responsive authenticated Web UI with dashboard, separate settings, live status, persistent RX/TX/DAPNET history and event debug log.
 - OLED status pages and user-button navigation.
 - GNSS position/time, selectable NTP servers and optional DS3231 RTC fallback.
 - LED notification/status modes.
-- Runtime configuration stored in ESP32 NVS.
+- Runtime configuration stored in ESP32 NVS; bounded message histories stored in LittleFS.
 - TX Inhibit safety interlock, NVS configuration viewer and factory-reset function.
 
 ## Hardware
@@ -134,11 +134,13 @@ The hamburger menu provides:
 
 The dashboard and message list update automatically without a full page reload. The top bar shows the firmware version, current system time and active time source, and includes a reboot button.
 
-The **NVS / Config** page shows PocketDAPNET's stored configuration values. WiFi passwords and DAPNET authentication keys are deliberately masked. A **Reset to factory defaults** action clears the PocketDAPNET NVS namespace and reboots the device. Runtime queues, received-message history and debug logs are RAM-only and are already cleared by a reboot.
+The **NVS / Config** page shows PocketDAPNET's stored configuration values. WiFi passwords, web passwords, API tokens and DAPNET authentication keys are deliberately masked. **Reset to factory defaults** clears the PocketDAPNET NVS namespace and the persistent message-history store, then reboots the device. The live DAPNET transmit queue and debug log remain RAM-only.
 
 ## Message history and debug log
 
-Received-message history and the debug event log are stored in RAM to avoid unnecessary flash wear. Both are cleared on reboot.
+PocketDAPNET stores bounded ring histories for the **last 30 received**, **last 30 transmitted**, and **last 30 DAPNET-handled** messages. These histories are persisted in LittleFS and survive reboot. Writes are bounded and update only the current ring slot plus metadata. A factory reset or the **Clear all history** action removes the stored histories.
+
+The event debug log and live DAPNET transmit queue are intentionally RAM-only and are cleared by reboot.
 
 The debug log records high-level DAPNET, queue, scheduler, time and RF events rather than bit-level ISR traffic, keeping runtime overhead low.
 
@@ -183,6 +185,51 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Please never include active passwords, A
 
 ## POCSAG TX diagnostics
 
-Version 0.6.9 keeps the detailed event-log diagnostics for every manual and DAPNET-triggered transmission. The log includes the decimal/hex RIC, POCSAG frame (`RIC & 7`), address field (`RIC >> 3`), baud rate, encoding, function bits, message length, target center frequency, oscillator correction, programmed center, expected low/high FSK tones, shift and configured TX power. This is intended to diagnose decoder interoperability issues without logging ISR/bit-level activity.
+Version 0.7.0 keeps the detailed event-log diagnostics for every manual and DAPNET-triggered transmission. The log includes the decimal/hex RIC, POCSAG frame (`RIC & 7`), address field (`RIC >> 3`), baud rate, encoding, function bits, message length, target center frequency, oscillator correction, programmed center, expected low/high FSK tones, shift and configured TX power. This is intended to diagnose decoder interoperability issues without logging ISR/bit-level activity.
 
 DAPNET scheduling also checks that enough time remains in the current 6.4-second slot before starting the next POCSAG page. If insufficient time remains, the queued page waits for the next effective slot.
+
+## Web authentication and API
+
+PocketDAPNET protects the complete web interface with HTTP Basic Authentication. On a fresh installation or after a factory reset, the default login is **`admin` / `pocketdapnet`**, so initial setup does not require a serial console. For safety, RF transmission is forcibly blocked while these public default credentials are still in use. Change the web password in **Settings -> Web / API security** before disabling TX Inhibit. The default login is also shown briefly on the OLED after boot.
+
+The username and password can be changed under **Settings -> Web / API security**. Passwords and API tokens are masked in the NVS viewer.
+
+An optional authenticated send API can be enabled in the same settings section. Configure an API bearer token of at least 16 characters, then send a message using an HTTP POST request:
+
+```bash
+curl -X POST \
+  -H 'Authorization: Bearer YOUR_API_TOKEN' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'ric=123456' \
+  --data-urlencode 'message=PocketDAPNET API test' \
+  http://DEVICE_IP/api/send
+```
+
+A successful request returns JSON. **TX Inhibit always has priority**; when it is active, API transmission is rejected even with a valid token.
+
+> HTTP Basic Authentication and bearer tokens do not encrypt traffic. Use PocketDAPNET only on a trusted LAN/VPN, or place it behind a trusted TLS reverse proxy if remote access is required. Do not expose the device web server directly to the public Internet.
+
+## Station identification
+
+PocketDAPNET can provide a local callsign-identification fallback using **RIC 8** and the configured DAPNET callsign. The default interval is 10 minutes and is configurable under **Settings -> Station identification**.
+
+When the DAPNET core supplies and PocketDAPNET successfully transmits a matching RIC-8 identification page, the local timer is reset. This prevents the firmware from unnecessarily sending an additional identification. When DAPNET is online, a short grace period is allowed for the core-provided identification before a local fallback is queued. The fallback uses the normal assigned-timeslot scheduler.
+
+Operators remain responsible for complying with the applicable amateur-radio identification and operating requirements in their jurisdiction.
+
+
+## Default web login
+
+The first-boot login is `admin` / `pocketdapnet`. RF transmission remains blocked until this default password is changed.
+
+
+## Runtime watchdog and diagnostics
+
+PocketDAPNET v0.7.0 monitors the main Arduino loop with a 15-second task watchdog. If the application loop stalls while the ESP32 networking stack remains alive, the device automatically reboots. The previous runtime stage, reset reason, heap metrics, and maximum loop latency are exposed in `/status` and the debug log to help locate blocking operations. I2C transactions also use a finite timeout.
+
+## Web security hardening
+
+PocketDAPNET validates configuration and send inputs before use, escapes dynamic HTML/JSON output, protects state-changing web forms with a per-boot CSRF token, and applies no-cache/security response headers including `Cache-Control`, `Pragma`, `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`, `Permissions-Policy` and a Content Security Policy.
+
+The optional send API requires a bearer token, accepts only `application/x-www-form-urlencoded`, validates RIC/message input, and is rate-limited to 10 accepted requests per 10 seconds. **TX Inhibit always overrides every transmission path.**

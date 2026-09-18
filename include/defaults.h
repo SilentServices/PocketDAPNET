@@ -22,6 +22,15 @@
 #define DEFAULT_STA_TIMEOUT_MS       15000UL
 
 #define DEFAULT_TX_INHIBIT           true
+
+#define DEFAULT_WEB_USERNAME         "admin"
+#define DEFAULT_WEB_PASSWORD         "pocketdapnet"
+#define DEFAULT_API_ENABLED          false
+#define DEFAULT_API_TOKEN            ""
+
+#define DEFAULT_STATION_ID_ENABLED   true
+#define DEFAULT_STATION_ID_INTERVAL_MIN 10
+#define DEFAULT_STATION_ID_RIC       8u
 #define DEFAULT_LED_MODE             "notifications"
 
 #define DEFAULT_NTP_PROVIDER         "pool"
@@ -34,4 +43,3 @@
 #define DEFAULT_DAPNET_AUTHKEY       ""
 #define DEFAULT_DAPNET_TIMESLOTS     ""
 
-#define RX_HISTORY_SIZE              30

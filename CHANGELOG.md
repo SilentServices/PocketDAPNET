@@ -2,6 +2,29 @@
 
 All notable changes to PocketDAPNET are documented here.
 
+## [0.7.0] - 2026-09-18
+
+### Added
+- HTTP Basic Authentication and configurable Web/API credentials.
+- Authenticated bearer-token `POST /api/send` with strict RIC/message validation and 10 requests/10 seconds rate limiting.
+- DAPNET-only local RIC-8 station-identification fallback.
+- Persistent LittleFS ring histories for the latest 30 RX, TX and DAPNET-handled messages.
+- Per-boot CSRF protection for state-changing Web UI forms.
+- Security and cache-control headers, including `Pragma: no-cache`.
+- Build ID in UI and status JSON.
+
+### Fixed
+- Long-runtime watchdog freeze in RadioLib POCSAG Direct RX by stopping DIO1 producer activity before `readData()` and rejecting incomplete non-32-bit-aligned buffer tails.
+- JSON/message-history rendering for POCSAG payloads containing control/non-UTF-8 bytes.
+- Automatic station ID no longer transmits while DAPNET is disabled.
+- `RADIOLIB_ERR_ADDRESS_NOT_FOUND` is treated as a normal non-matching batch instead of a decode failure.
+
+### Security
+- Centralized settings and send-input validation.
+- HTML/JSON output escaping for untrusted message/configuration data.
+- Factory reset clears NVS and persistent histories.
+- TX remains blocked while public default web credentials are active.
+
 ## [0.6.9] - 2026-09-15
 
 ### Changed

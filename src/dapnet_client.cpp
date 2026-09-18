@@ -27,6 +27,7 @@ void DapnetClient::configure(const String &newHost, uint16_t newPort,
   callsign = newCallsign;
   callsign.toLowerCase();
   authKey = newAuthKey;
+  rxBuffer.reserve(512);
   enabled = newEnabled;
   if (!enabled) {
     disconnect("disabled");
@@ -113,7 +114,10 @@ void DapnetClient::loop(bool networkAvailable) {
 }
 
 void DapnetClient::processInput() {
-  while (client.connected() && client.available()) {
+  // Never let a busy TCP socket monopolize the Arduino loop. Web UI, buttons,
+  // watchdog and radio state must continue to be serviced.
+  size_t byteBudget = 384;
+  while (client.connected() && client.available() && byteBudget--) {
     char c = (char)client.read();
     if (c == '\n') {
       String line = rxBuffer;

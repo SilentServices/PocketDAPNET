@@ -10,12 +10,18 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <FS.h>
+#include <LittleFS.h>
 #include <RadioLib.h>
 #include <U8g2lib.h>
 #include <TinyGPSPlus.h>
 #include <time.h>
 #include <sys/time.h>
 #include "esp_sntp.h"
+#include <esp_system.h>
+#include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
+#include <esp_idf_version.h>
 
 #define XPOWERS_CHIP_AXP2101
 #include <XPowersLib.h>
@@ -53,6 +59,14 @@ struct AppConfig {
   String apPassword = DEFAULT_AP_PASSWORD;
 
   bool txInhibit = DEFAULT_TX_INHIBIT;
+  String webUsername = DEFAULT_WEB_USERNAME;
+  String webPassword = DEFAULT_WEB_PASSWORD;
+  bool apiEnabled = DEFAULT_API_ENABLED;
+  String apiToken = DEFAULT_API_TOKEN;
+
+  bool stationIdEnabled = DEFAULT_STATION_ID_ENABLED;
+  uint16_t stationIdIntervalMin = DEFAULT_STATION_ID_INTERVAL_MIN;
+
   float frequencyMHz = DEFAULT_POCSAG_FREQUENCY_MHZ;
   float rxCorrectionMHz = DEFAULT_RX_FREQ_CORR_MHZ;
   float txCorrectionMHz = DEFAULT_TX_FREQ_CORR_MHZ;
@@ -76,15 +90,40 @@ struct AppConfig {
   String dapnetTimeslots = DEFAULT_DAPNET_TIMESLOTS;
 };
 
-struct RxHistoryEntry {
+struct HistoryEntry {
   uint32_t sequence = 0;
   uint32_t uptimeSeconds = 0;
+  int64_t timestamp = 0;
   uint32_t ric = 0;
-  float rssi = 0;
-  time_t receivedAt = 0;
-  bool timeValid = false;
-  bool configuredRic = false;
-  String message;
+  int16_t rssi10 = 0;
+  uint16_t baud = 0;
+  int8_t txPowerDbm = 0;
+  uint8_t type = 0;
+  uint8_t function = 0;
+  uint8_t speedCode = 0;
+  uint8_t flags = 0;
+  char source[16] = {0};
+  char status[32] = {0};
+  char message[241] = {0};
+};
+
+static constexpr uint8_t HISTORY_FLAG_TIME_VALID = 0x01;
+static constexpr uint8_t HISTORY_FLAG_CONFIGURED = 0x02;
+static constexpr uint8_t HISTORY_FLAG_SUCCESS = 0x04;
+static constexpr size_t HISTORY_SIZE = 30;
+static constexpr uint32_t HISTORY_MAGIC = 0x50444831u; // PDH1
+static constexpr uint16_t HISTORY_FORMAT_VERSION = 1;
+
+struct HistoryFileHeader {
+  uint32_t magic = HISTORY_MAGIC;
+  uint16_t version = HISTORY_FORMAT_VERSION;
+  uint16_t recordSize = sizeof(HistoryEntry);
+  uint16_t capacity = HISTORY_SIZE;
+  uint16_t rxHead = 0, rxCount = 0;
+  uint16_t txHead = 0, txCount = 0;
+  uint16_t dapnetHead = 0, dapnetCount = 0;
+  uint32_t rxSequence = 0, txSequence = 0, dapnetSequence = 0;
+  uint32_t crc32 = 0;
 };
 
 AppConfig cfg;
@@ -109,6 +148,10 @@ uint32_t dapnetDropCount = 0;
 uint32_t dapnetLastTxMillis = 0;
 String dapnetLastMessage;
 uint32_t dapnetLastRic = 0;
+
+uint32_t lastStationIdMillis = 0;
+bool stationIdQueued = false;
+String generatedWebPassword;
 
 static constexpr size_t DEBUG_LOG_SIZE = 96;
 String debugLogLines[DEBUG_LOG_SIZE];
@@ -152,10 +195,17 @@ uint32_t lastRxRic = 0;
 float lastRxRssi = 0;
 String lastTxStatus = "not sent yet";
 
-RxHistoryEntry rxHistory[RX_HISTORY_SIZE];
-size_t rxHistoryHead = 0;
-size_t rxHistoryCount = 0;
-uint32_t rxSequence = 0;
+HistoryEntry rxHistory[HISTORY_SIZE];
+HistoryEntry txHistory[HISTORY_SIZE];
+HistoryEntry dapnetHistory[HISTORY_SIZE];
+size_t rxHistoryHead = 0, rxHistoryCount = 0;
+size_t txHistoryHead = 0, txHistoryCount = 0;
+size_t dapnetHistoryHead = 0, dapnetHistoryCount = 0;
+uint32_t rxSequence = 0, txSequence = 0, dapnetHistorySequence = 0;
+bool littleFsAvailable = false;
+String csrfToken;
+uint32_t apiRequestTimes[10] = {0};
+size_t apiRequestIndex = 0;
 
 uint8_t displayPage = 0;
 static constexpr uint8_t DISPLAY_PAGE_COUNT = 6;
@@ -163,6 +213,59 @@ uint32_t lastDisplayUpdate = 0;
 int lastButtonState = HIGH;
 uint32_t buttonDownAt = 0;
 bool buttonLongHandled = false;
+
+// Runtime health diagnostics. RTC no-init memory survives watchdog/software resets
+// without being reinitialized, allowing the next boot to report the operation
+// in which the main loop stalled.
+static constexpr uint32_t HEALTH_MAGIC = 0x50444E54u;  // "PDNT"
+RTC_NOINIT_ATTR uint32_t healthMagic;
+RTC_NOINIT_ATTR char healthLastStage[40];
+uint32_t loopLastMs = 0;
+uint32_t loopMaxMs = 0;
+uint32_t loopCounter = 0;
+String bootPreviousStage;
+
+static bool webUsesDefaultPassword();
+static bool txBlocked();
+static uint16_t dapnetBaud(uint8_t speedCode);
+
+static void setHealthStage(const char *stage) {
+  if (!stage) return;
+  strncpy(healthLastStage, stage, sizeof(healthLastStage) - 1);
+  healthLastStage[sizeof(healthLastStage) - 1] = '\0';
+}
+
+static void initLoopWatchdog() {
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t config = {};
+  config.timeout_ms = 15000;
+  config.idle_core_mask = 0;
+  config.trigger_panic = true;
+  esp_err_t err = esp_task_wdt_init(&config);
+  if (err == ESP_ERR_INVALID_STATE) err = esp_task_wdt_reconfigure(&config);
+  esp_err_t addErr = esp_task_wdt_add(NULL);
+  Serial.printf("[WATCHDOG] init=%d add=%d timeout=15s\n", (int)err, (int)addErr);
+#else
+  esp_err_t err = esp_task_wdt_init(15, true);
+  esp_err_t addErr = esp_task_wdt_add(NULL);
+  Serial.printf("[WATCHDOG] init=%d add=%d timeout=15s\n", (int)err, (int)addErr);
+#endif
+}
+
+static void feedLoopWatchdog() {
+  esp_task_wdt_reset();
+}
+
+static void initMemoryReservations() {
+  // These strings are updated repeatedly for the lifetime of the device.
+  // Reserving once avoids long-term heap fragmentation from log/history churn.
+  for (size_t i = 0; i < DEBUG_LOG_SIZE; ++i) debugLogLines[i].reserve(224);
+  lastRxMessage.reserve(256);
+  lastTxStatus.reserve(96);
+  dapnetLastMessage.reserve(256);
+  lastSchedulerReason.reserve(128);
+  activeNtpServer.reserve(96);
+}
 
 static void addDebugLog(const String &category, const String &message) {
   String stamp;
@@ -211,13 +314,53 @@ static String htmlEscape(const String &s) {
 }
 
 static String jsonEscape(const String &s) {
+  // Encode arbitrary received bytes as valid JSON/UTF-8. POCSAG payloads can
+  // contain control or non-ASCII bytes; emitting those bytes verbatim can make
+  // response.json() fail in the browser and leave the UI stuck at Loading....
+  static const char hex[] = "0123456789ABCDEF";
   String out;
+  out.reserve(s.length() + 16);
   for (size_t i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (c == '"' || c == '\\') { out += '\\'; out += c; }
-    else if (c == '\n') out += "\\n";
-    else if (c == '\r') out += "\\r";
-    else out += c;
+    const uint8_t c = static_cast<uint8_t>(s[i]);
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        // Keep printable 7-bit ASCII as-is. Escape controls, DEL, and all
+        // high-bit bytes so malformed/non-UTF-8 payloads cannot break JSON.
+        if (c < 0x20 || c >= 0x7F) {
+          out += "\\u00";
+          out += hex[(c >> 4) & 0x0F];
+          out += hex[c & 0x0F];
+        } else {
+          out += static_cast<char>(c);
+        }
+        break;
+    }
+  }
+  return out;
+}
+
+static String displaySafeText(const String &s) {
+  // Human-readable representation for web message history. Keep normal ASCII
+  // unchanged and render non-printable/raw bytes visibly as \xNN.
+  static const char hex[] = "0123456789ABCDEF";
+  String out;
+  out.reserve(s.length() + 16);
+  for (size_t i = 0; i < s.length(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(s[i]);
+    if (c >= 0x20 && c <= 0x7E) {
+      out += static_cast<char>(c);
+    } else {
+      out += "\\x";
+      out += hex[(c >> 4) & 0x0F];
+      out += hex[c & 0x0F];
+    }
   }
   return out;
 }
@@ -304,30 +447,173 @@ static String currentLocalTime() {
   return systemTimeValid() ? formatLocalTime(time(nullptr)) : String("unsynced");
 }
 
-static void addRxHistory(uint32_t ric, float rssi, const String &message) {
-  RxHistoryEntry &e = rxHistory[rxHistoryHead];
-  e.sequence = ++rxSequence;
+static uint32_t crc32Bytes(const uint8_t *data, size_t len) {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)-(int32_t)(crc & 1u));
+  }
+  return ~crc;
+}
+
+static void copyHistoryField(char *dst, size_t dstSize, const String &value) {
+  if (!dstSize) return;
+  const size_t len = min(value.length(), dstSize - 1);
+  memcpy(dst, value.c_str(), len);
+  dst[len] = '\0';
+}
+
+static uint32_t historyHeaderCrc(const HistoryFileHeader &header) {
+  HistoryFileHeader copy = header;
+  copy.crc32 = 0;
+  return crc32Bytes(reinterpret_cast<const uint8_t*>(&copy), sizeof(copy));
+}
+
+static void buildHistoryHeader(HistoryFileHeader &h) {
+  h = HistoryFileHeader();
+  h.rxHead = rxHistoryHead; h.rxCount = rxHistoryCount;
+  h.txHead = txHistoryHead; h.txCount = txHistoryCount;
+  h.dapnetHead = dapnetHistoryHead; h.dapnetCount = dapnetHistoryCount;
+  h.rxSequence = rxSequence; h.txSequence = txSequence; h.dapnetSequence = dapnetHistorySequence;
+  h.crc32 = historyHeaderCrc(h);
+}
+
+static bool persistHistoryFull() {
+  if (!littleFsAvailable) return false;
+  File file = LittleFS.open("/history.bin.tmp", "w");
+  if (!file) return false;
+  HistoryFileHeader header; buildHistoryHeader(header);
+  bool ok = file.write(reinterpret_cast<const uint8_t*>(&header), sizeof(header)) == sizeof(header);
+  if (ok) ok = file.write(reinterpret_cast<const uint8_t*>(rxHistory), sizeof(rxHistory)) == sizeof(rxHistory);
+  if (ok) ok = file.write(reinterpret_cast<const uint8_t*>(txHistory), sizeof(txHistory)) == sizeof(txHistory);
+  if (ok) ok = file.write(reinterpret_cast<const uint8_t*>(dapnetHistory), sizeof(dapnetHistory)) == sizeof(dapnetHistory);
+  file.flush(); file.close();
+  if (!ok) { LittleFS.remove("/history.bin.tmp"); return false; }
+  LittleFS.remove("/history.bin");
+  return LittleFS.rename("/history.bin.tmp", "/history.bin");
+}
+
+static bool persistHistorySlot(uint8_t category, size_t index) {
+  if (!littleFsAvailable || index >= HISTORY_SIZE) return false;
+  if (!LittleFS.exists("/history.bin") && !persistHistoryFull()) return false;
+  File file = LittleFS.open("/history.bin", "r+");
+  if (!file) return false;
+  HistoryFileHeader header; buildHistoryHeader(header);
+  const HistoryEntry *entry = nullptr;
+  if (category == 0) entry = &rxHistory[index];
+  else if (category == 1) entry = &txHistory[index];
+  else if (category == 2) entry = &dapnetHistory[index];
+  const size_t recordIndex = (size_t)category * HISTORY_SIZE + index;
+  const size_t offset = sizeof(HistoryFileHeader) + recordIndex * sizeof(HistoryEntry);
+  bool ok = entry != nullptr && file.seek(offset, SeekSet) && file.write(reinterpret_cast<const uint8_t*>(entry), sizeof(HistoryEntry)) == sizeof(HistoryEntry);
+  // Commit metadata last so a power loss cannot point the ring head at a record
+  // that was never written completely.
+  if (ok) ok = file.seek(0, SeekSet) && file.write(reinterpret_cast<const uint8_t*>(&header), sizeof(header)) == sizeof(header);
+  file.flush(); file.close();
+  return ok;
+}
+
+static bool restoreHistory() {
+  if (!littleFsAvailable || !LittleFS.exists("/history.bin")) return false;
+  File file = LittleFS.open("/history.bin", "r");
+  if (!file) return false;
+  HistoryFileHeader h{};
+  bool ok = file.read(reinterpret_cast<uint8_t*>(&h), sizeof(h)) == sizeof(h);
+  ok = ok && h.magic == HISTORY_MAGIC && h.version == HISTORY_FORMAT_VERSION &&
+       h.recordSize == sizeof(HistoryEntry) && h.capacity == HISTORY_SIZE &&
+       h.rxHead < HISTORY_SIZE && h.txHead < HISTORY_SIZE && h.dapnetHead < HISTORY_SIZE &&
+       h.rxCount <= HISTORY_SIZE && h.txCount <= HISTORY_SIZE && h.dapnetCount <= HISTORY_SIZE &&
+       h.crc32 == historyHeaderCrc(h);
+  if (ok) ok = file.read(reinterpret_cast<uint8_t*>(rxHistory), sizeof(rxHistory)) == sizeof(rxHistory);
+  if (ok) ok = file.read(reinterpret_cast<uint8_t*>(txHistory), sizeof(txHistory)) == sizeof(txHistory);
+  if (ok) ok = file.read(reinterpret_cast<uint8_t*>(dapnetHistory), sizeof(dapnetHistory)) == sizeof(dapnetHistory);
+  file.close();
+  if (!ok) return false;
+  rxHistoryHead=h.rxHead; rxHistoryCount=h.rxCount; txHistoryHead=h.txHead; txHistoryCount=h.txCount;
+  dapnetHistoryHead=h.dapnetHead; dapnetHistoryCount=h.dapnetCount;
+  rxSequence=h.rxSequence; txSequence=h.txSequence; dapnetHistorySequence=h.dapnetSequence;
+  return true;
+}
+
+static void initHistoryStorage() {
+  littleFsAvailable = LittleFS.begin(true);
+  if (!littleFsAvailable) {
+    Serial.println("[HISTORY] LittleFS unavailable; using RAM-only history");
+    addDebugLog("HISTORY", "LittleFS unavailable; RAM-only");
+    return;
+  }
+  const bool restored = restoreHistory();
+  if (!restored) { LittleFS.remove("/history.bin"); persistHistoryFull(); }
+  Serial.printf("[HISTORY] %s RX=%u TX=%u DAPNET=%u\n", restored ? "restored" : "empty", (unsigned)rxHistoryCount, (unsigned)txHistoryCount, (unsigned)dapnetHistoryCount);
+}
+
+static void fillHistoryEntry(HistoryEntry &e, uint32_t sequence, uint32_t ric, const String &message) {
+  memset(&e, 0, sizeof(e));
+  e.sequence = sequence;
   e.uptimeSeconds = millis() / 1000UL;
+  if (systemTimeValid()) { e.timestamp = (int64_t)time(nullptr); e.flags |= HISTORY_FLAG_TIME_VALID; }
   e.ric = ric;
-  e.rssi = rssi;
-  e.receivedAt = systemTimeValid() ? time(nullptr) : 0;
-  e.timeValid = e.receivedAt > 0;
-  e.configuredRic = isConfiguredRic(ric);
-  e.message = message;
-  rxHistoryHead = (rxHistoryHead + 1) % RX_HISTORY_SIZE;
-  if (rxHistoryCount < RX_HISTORY_SIZE) rxHistoryCount++;
+  copyHistoryField(e.message, sizeof(e.message), message);
 }
 
-static const RxHistoryEntry* historyNewest(size_t index) {
-  if (index >= rxHistoryCount) return nullptr;
-  size_t pos = (rxHistoryHead + RX_HISTORY_SIZE - 1 - index) % RX_HISTORY_SIZE;
-  return &rxHistory[pos];
+static void addRxHistory(uint32_t ric, float rssi, const String &message) {
+  const size_t slot = rxHistoryHead;
+  HistoryEntry &e = rxHistory[slot];
+  fillHistoryEntry(e, ++rxSequence, ric, message);
+  e.rssi10 = (int16_t)lroundf(rssi * 10.0f);
+  e.baud = cfg.baud;
+  if (isConfiguredRic(ric)) e.flags |= HISTORY_FLAG_CONFIGURED;
+  copyHistoryField(e.source, sizeof(e.source), "RF-RX");
+  copyHistoryField(e.status, sizeof(e.status), "received");
+  rxHistoryHead = (rxHistoryHead + 1) % HISTORY_SIZE;
+  if (rxHistoryCount < HISTORY_SIZE) rxHistoryCount++;
+  persistHistorySlot(0, slot);
 }
 
-static void clearHistory() {
-  for (size_t i = 0; i < RX_HISTORY_SIZE; i++) rxHistory[i].message = "";
-  rxHistoryHead = 0;
-  rxHistoryCount = 0;
+static void addTxHistory(uint32_t ric, const String &message, uint16_t baud, const char *source, bool success, const String &status) {
+  const size_t slot = txHistoryHead;
+  HistoryEntry &e = txHistory[slot];
+  fillHistoryEntry(e, ++txSequence, ric, message);
+  e.baud = baud; e.txPowerDbm = cfg.txPowerDbm;
+  if (success) e.flags |= HISTORY_FLAG_SUCCESS;
+  copyHistoryField(e.source, sizeof(e.source), String(source ? source : "?"));
+  copyHistoryField(e.status, sizeof(e.status), status);
+  txHistoryHead = (txHistoryHead + 1) % HISTORY_SIZE;
+  if (txHistoryCount < HISTORY_SIZE) txHistoryCount++;
+  persistHistorySlot(1, slot);
+}
+
+static void addDapnetHistory(const DapnetMessage &msg, const String &status) {
+  const size_t slot = dapnetHistoryHead;
+  HistoryEntry &e = dapnetHistory[slot];
+  fillHistoryEntry(e, ++dapnetHistorySequence, msg.ric, msg.text);
+  e.type=msg.type; e.function=msg.function; e.speedCode=msg.speedCode; e.baud=dapnetBaud(msg.speedCode);
+  copyHistoryField(e.source, sizeof(e.source), "DAPNET");
+  copyHistoryField(e.status, sizeof(e.status), status);
+  dapnetHistoryHead = (dapnetHistoryHead + 1) % HISTORY_SIZE;
+  if (dapnetHistoryCount < HISTORY_SIZE) dapnetHistoryCount++;
+  persistHistorySlot(2, slot);
+}
+
+static void updateDapnetHistoryStatus(uint32_t ric, const String &message, const String &status) {
+  for (size_t i=0; i<dapnetHistoryCount; ++i) {
+    const size_t pos=(dapnetHistoryHead+HISTORY_SIZE-1-i)%HISTORY_SIZE;
+    HistoryEntry &e=dapnetHistory[pos];
+    if (e.ric==ric && String(e.message)==message) { copyHistoryField(e.status,sizeof(e.status),status); persistHistorySlot(2, pos); return; }
+  }
+}
+
+static const HistoryEntry* historyNewest(const HistoryEntry *entries, size_t head, size_t count, size_t index) {
+  if (index >= count) return nullptr;
+  const size_t pos=(head+HISTORY_SIZE-1-index)%HISTORY_SIZE;
+  return &entries[pos];
+}
+
+static void clearAllHistory() {
+  memset(rxHistory,0,sizeof(rxHistory)); memset(txHistory,0,sizeof(txHistory)); memset(dapnetHistory,0,sizeof(dapnetHistory));
+  rxHistoryHead=rxHistoryCount=txHistoryHead=txHistoryCount=dapnetHistoryHead=dapnetHistoryCount=0;
+  rxSequence=txSequence=dapnetHistorySequence=0;
+  if (littleFsAvailable) LittleFS.remove("/history.bin");
 }
 
 // Persistence
@@ -339,6 +625,13 @@ static void loadConfig() {
   cfg.apSsid = prefs.getString("apssid", DEFAULT_AP_SSID);
   cfg.apPassword = prefs.getString("appass", DEFAULT_AP_PASSWORD);
   cfg.txInhibit = prefs.getBool("txinhib", DEFAULT_TX_INHIBIT);
+  cfg.webUsername = prefs.getString("webuser", DEFAULT_WEB_USERNAME);
+  cfg.webPassword = prefs.getString("webpass", DEFAULT_WEB_PASSWORD);
+  cfg.apiEnabled = prefs.getBool("apien", DEFAULT_API_ENABLED);
+  cfg.apiToken = prefs.getString("apitoken", DEFAULT_API_TOKEN);
+  cfg.stationIdEnabled = prefs.getBool("idenable", DEFAULT_STATION_ID_ENABLED);
+  cfg.stationIdIntervalMin = prefs.getUShort("idint", DEFAULT_STATION_ID_INTERVAL_MIN);
+  if (cfg.stationIdIntervalMin < 1 || cfg.stationIdIntervalMin > 60) cfg.stationIdIntervalMin = DEFAULT_STATION_ID_INTERVAL_MIN;
   cfg.frequencyMHz = prefs.getFloat("freq", DEFAULT_POCSAG_FREQUENCY_MHZ);
   // Migration from v0.3: old global correction becomes TX correction.
   float oldCorrection = prefs.getFloat("fcorr", DEFAULT_TX_FREQ_CORR_MHZ);
@@ -373,6 +666,12 @@ static void saveConfig() {
   prefs.putString("apssid", cfg.apSsid);
   prefs.putString("appass", cfg.apPassword);
   prefs.putBool("txinhib", cfg.txInhibit);
+  prefs.putString("webuser", cfg.webUsername);
+  prefs.putString("webpass", cfg.webPassword);
+  prefs.putBool("apien", cfg.apiEnabled);
+  prefs.putString("apitoken", cfg.apiToken);
+  prefs.putBool("idenable", cfg.stationIdEnabled);
+  prefs.putUShort("idint", cfg.stationIdIntervalMin);
   prefs.putFloat("freq", cfg.frequencyMHz);
   prefs.putFloat("rxcorr", cfg.rxCorrectionMHz);
   prefs.putFloat("txcorr", cfg.txCorrectionMHz);
@@ -594,15 +893,26 @@ static void drawLine(uint8_t y, const String &text) {
 static String effectiveDapnetTimeslots();
 
 static void drawDisplay() {
+  setHealthStage("display");
   if (!displayAvailable) return;
   display.clearBuffer();
   display.setFont(u8g2_font_6x10_tf);
-  String title = "T-Beam POCSAG " + String(displayPage + 1) + "/" + String(DISPLAY_PAGE_COUNT);
+  if (generatedWebPassword.length() && millis() < 60000UL) {
+    drawLine(9, "PocketDAPNET AUTH");
+    display.drawHLine(0, 12, 128);
+    drawLine(27, "User: " + cfg.webUsername);
+    drawLine(40, "Pass:");
+    drawLine(53, generatedWebPassword);
+    display.sendBuffer();
+    lastDisplayUpdate = millis();
+    return;
+  }
+  String title = "PocketDAPNET " + String(displayPage + 1) + "/" + String(DISPLAY_PAGE_COUNT);
   drawLine(9, title);
   display.drawHLine(0, 12, 128);
 
   if (displayPage == 0) {
-    drawLine(24, String("RX:") + (receiverRunning ? "on" : "off") + (cfg.txInhibit ? " TX:INHIB" : " TX:ready"));
+    drawLine(24, String("RX:") + (receiverRunning ? "on" : "off") + (txBlocked() ? " TX:INHIB" : " TX:ready"));
     drawLine(35, "F: " + String(cfg.frequencyMHz, 4));
     drawLine(46, "Baud: " + String(cfg.baud));
     drawLine(57, "RICs: " + String((unsigned)rxAddressCount));
@@ -665,6 +975,7 @@ static void handleButton() {
 // Power + radio
 static void initPower() {
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setTimeOut(50);  // never let an I2C peripheral stall the main loop indefinitely
   if (!pmu.begin(Wire, AXP2101_SLAVE_ADDRESS, PIN_I2C_SDA, PIN_I2C_SCL)) {
     Serial.println("[AXP2101] PMU not found");
     while (true) delay(1000);
@@ -716,8 +1027,8 @@ static void stopReceiver() {
 
 static bool sendPocsagAdvanced(uint32_t ric, const String &message, uint16_t baud,
                                uint8_t encoding, uint8_t function, const char *source) {
-  if (cfg.txInhibit) {
-    lastTxStatus = "TX inhibited";
+  if (txBlocked()) {
+    lastTxStatus = webUsesDefaultPassword() ? "TX blocked: change default web password" : "TX inhibited";
     addDebugLog("TX", "blocked by TX inhibit");
     return false;
   }
@@ -772,6 +1083,17 @@ static bool sendPocsagAdvanced(uint32_t ric, const String &message, uint16_t bau
     if (rxState != RADIOLIB_ERR_NONE) Serial.printf("[POCSAG] RX resume failed: %d\n", rxState);
   }
   setTxLed(false);
+  addTxHistory(ric, message, baud, source, state == RADIOLIB_ERR_NONE, lastTxStatus);
+  if (state == RADIOLIB_ERR_NONE) {
+    String idCall = cfg.dapnetCallsign;
+    idCall.trim(); idCall.toUpperCase();
+    String sentText = message; sentText.trim(); sentText.toUpperCase();
+    if (ric == DEFAULT_STATION_ID_RIC && idCall.length() && sentText == idCall) {
+      lastStationIdMillis = millis();
+      stationIdQueued = false;
+      addDebugLog("ID", "station identification transmitted");
+    }
+  }
   drawDisplay();
   return state == RADIOLIB_ERR_NONE;
 }
@@ -831,6 +1153,7 @@ static bool enqueueDapnetMessage(const DapnetMessage &message) {
   if (dapnetQueueCount >= DAPNET_QUEUE_SIZE) {
     dapnetDropCount++;
     addDebugLog("QUEUE", "DROP queue full RIC=" + String(message.ric));
+    addDapnetHistory(message, "dropped: queue full");
     return false;
   }
   dapnetQueue[dapnetQueueHead] = message;
@@ -839,6 +1162,7 @@ static bool enqueueDapnetMessage(const DapnetMessage &message) {
   dapnetLastMessage = message.text;
   dapnetLastRic = message.ric;
   addDebugLog("QUEUE", "enqueue RIC=" + String(message.ric) + " depth=" + String((unsigned)dapnetQueueCount));
+  addDapnetHistory(message, "queued");
   return true;
 }
 
@@ -891,7 +1215,7 @@ static uint32_t currentDapnetSlotRemainingMs() {
 
 static String dapnetSchedulerReason() {
   if (!dapnetQueueCount) return "queue empty";
-  if (cfg.txInhibit) return "TX inhibited";
+  if (txBlocked()) return webUsesDefaultPassword() ? "TX blocked: default password" : "TX inhibited";
   if (!dapnet.isOnline()) return "DAPNET not online";
   if (!systemTimeValid()) return "time not synchronized";
   int slot = currentDapnetSlot();
@@ -924,7 +1248,7 @@ static void logSchedulerState(bool force = false) {
 static void processDapnetQueue() {
   if (!dapnetQueueCount) return;
   logSchedulerState();
-  if (cfg.txInhibit) return;
+  if (txBlocked()) return;
   if (!dapnet.isOnline()) return;
   if (!systemTimeValid()) return;  // slot scheduling requires synchronized time
   if (!currentDapnetSlotAllowed()) return;
@@ -952,6 +1276,7 @@ static void processDapnetQueue() {
                 (unsigned)dapnetQueueCount);
   bool ok = sendPocsagAdvanced(msg.ric, msg.text, baud, encoding, function, "DAPNET");
   dapnetLastTxMillis = millis();
+  updateDapnetHistoryStatus(msg.ric, msg.text, ok ? "rf tx success" : "rf tx failed");
   if (ok) { dapnetTxCount++; addDebugLog("TX", "success RIC=" + String(msg.ric)); }
   else { dapnetTxFailCount++; addDebugLog("TX", "FAILED RIC=" + String(msg.ric) + " status=" + lastTxStatus); }
 }
@@ -991,6 +1316,152 @@ static void initWifi() {
   else startAccessPoint(true);
 }
 
+// Authentication, API and local station identification
+static String randomToken(size_t len) {
+  static const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  String out;
+  out.reserve(len);
+  for (size_t i = 0; i < len; ++i) out += alphabet[esp_random() % (sizeof(alphabet) - 1)];
+  return out;
+}
+
+static void prepareResponseHeaders(bool html=false) {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.sendHeader("X-Content-Type-Options", "nosniff");
+  server.sendHeader("Referrer-Policy", "no-referrer");
+  server.sendHeader("X-Frame-Options", "DENY");
+  server.sendHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  server.sendHeader("Cross-Origin-Resource-Policy", "same-origin");
+  if (html) server.sendHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+}
+static void sendHtml(int code,const String &body){prepareResponseHeaders(true);server.send(code,"text/html; charset=utf-8",body);}
+static void sendJson(int code,const String &body){prepareResponseHeaders(false);server.send(code,"application/json; charset=utf-8",body);}
+static void sendText(int code,const String &body){prepareResponseHeaders(false);server.send(code,"text/plain; charset=utf-8",body);}
+static void redirectTo(const String &where){prepareResponseHeaders(false);server.sendHeader("Location",where);server.send(303);}
+
+static bool requireCsrf(){
+  if(server.hasArg("csrf") && server.arg("csrf")==csrfToken) return true;
+  addDebugLog("SECURITY","CSRF validation failed for "+server.uri()); sendText(403,"CSRF validation failed"); return false;
+}
+static bool apiRateAllowed(){
+  const uint32_t now=millis(); size_t recent=0;
+  for(size_t i=0;i<10;++i) if(apiRequestTimes[i] && (uint32_t)(now-apiRequestTimes[i])<10000UL) recent++;
+  if(recent>=10) return false; apiRequestTimes[apiRequestIndex]=now; apiRequestIndex=(apiRequestIndex+1)%10; return true;
+}
+static bool printableAscii(const String &v,size_t maxLen,bool allowEmpty=false){
+  if((!allowEmpty&&!v.length())||v.length()>maxLen)return false; for(size_t i=0;i<v.length();++i){uint8_t c=(uint8_t)v[i];if(c<0x20||c>0x7E)return false;}return true;
+}
+static bool parseRicStrict(String v,uint32_t &ric){v.trim();if(!v.length()||v.length()>7)return false;for(size_t i=0;i<v.length();++i)if(!isDigit(v[i]))return false;unsigned long n=strtoul(v.c_str(),nullptr,10);if(n>RADIOLIB_PAGER_ADDRESS_MAX)return false;ric=(uint32_t)n;return true;}
+static bool validHostname(String v,bool allowEmpty=true){v.trim();if(!v.length())return allowEmpty;if(v.length()>253)return false;for(size_t i=0;i<v.length();++i){char c=v[i];if(!(isalnum((unsigned char)c)||c=='.'||c=='-'))return false;}return true;}
+static bool validRicList(String input){
+  if(input.length()>512)return false;input.replace(";",",");input.replace("\n",",");input.replace("\r",",");int start=0,count=0;
+  while(start<input.length()){int comma=input.indexOf(',',start);if(comma<0)comma=input.length();String token=input.substring(start,comma);token.trim();if(token.length()){uint32_t ric=0;if(!parseRicStrict(token,ric))return false;if(++count>32)return false;}start=comma+1;}return true;
+}
+static String validateSettingsInput(){
+  String v=server.arg("wssid");if(v.length()>32)return "Client SSID exceeds 32 characters";
+  v=server.arg("wpass");if(v.length()>64)return "Client password is too long";
+  v=server.arg("apssid");if(!v.length()||v.length()>32)return "AP SSID must be 1-32 characters";
+  v=server.arg("appass");if(v.length()&&(v.length()<8||v.length()>63))return "AP password must be 8-63 characters";
+  v=server.arg("webuser");v.trim();if(!printableAscii(v,32))return "Web username must be 1-32 printable ASCII characters";
+  v=server.arg("webpass");if(v.length()&&(!printableAscii(v,64)||v.length()<8))return "Web password must be 8-64 printable ASCII characters";
+  v=server.arg("apitoken");if(v.length()&&(!printableAscii(v,128)||v.length()<16))return "API token must be 16-128 printable ASCII characters";
+  float f=server.arg("freq").toFloat();if(f<400.0f||f>510.0f)return "Base frequency must be within 400-510 MHz";
+  float rc=server.arg("rxcorr").toFloat(),tc=server.arg("txcorr").toFloat();if(rc<-.1f||rc>.1f||tc<-.1f||tc>.1f)return "Frequency correction must be within +/-0.1 MHz";
+  int b=server.arg("baud").toInt();if(!(b==512||b==1200||b==2400))return "Baud must be 512, 1200 or 2400";
+  int sh=server.arg("shift").toInt();if(sh<1000||sh>10000)return "FSK shift must be 1000-10000 Hz";
+  int pw=server.arg("txpower").toInt();if(!((pw>=2&&pw<=17)||pw==20))return "Unsupported TX power";
+  uint32_t r=0;if(!parseRicStrict(server.arg("ownric"),r))return "Invalid own RIC";
+  if(!validRicList(server.arg("rxrics")))return "Receive RIC list contains invalid values or more than 32 RICs";
+  if(!validHostname(server.arg("dhost")))return "Invalid DAPNET host";int port=server.arg("dport").toInt();if(port<1||port>65535)return "Invalid DAPNET port";
+  v=server.arg("dcall");v.trim();if(v.length()>16||(v.length()&&!printableAscii(v,16)))return "Invalid callsign/node name";
+  if(!validHostname(server.arg("ntpcustom")))return "Invalid custom NTP host";
+  int ident=server.arg("idint").toInt();if(ident<1||ident>60)return "Station ID interval must be 1-60 minutes";
+  if(server.hasArg("denable")){if(!server.arg("dhost").length())return "DAPNET server is required when DAPNET is enabled";if(!server.arg("dcall").length())return "DAPNET callsign/node is required when DAPNET is enabled";if(!server.arg("dkey").length()&&!cfg.dapnetAuthKey.length())return "DAPNET AuthKey is required when DAPNET is enabled";if(!normalizeDapnetTimeslots(server.arg("dslots")).length())return "Assigned DAPNET timeslots are required when DAPNET is enabled";}
+  return "";
+}
+
+static bool webUsesDefaultPassword() {
+  return cfg.webUsername == DEFAULT_WEB_USERNAME && cfg.webPassword == DEFAULT_WEB_PASSWORD;
+}
+
+static bool txBlocked() {
+  // A publicly-known default password must never permit RF transmission.
+  return cfg.txInhibit || webUsesDefaultPassword();
+}
+
+static void ensureWebCredentials() {
+  bool changed = false;
+  if (!cfg.webUsername.length()) { cfg.webUsername = DEFAULT_WEB_USERNAME; changed = true; }
+  if (!cfg.webPassword.length()) { cfg.webPassword = DEFAULT_WEB_PASSWORD; changed = true; }
+  if (webUsesDefaultPassword()) {
+    cfg.txInhibit = true;
+    generatedWebPassword = DEFAULT_WEB_PASSWORD;  // shown briefly on OLED for first-time users
+    changed = true;
+    Serial.printf("[AUTH] default credentials active: %s / %s\n", cfg.webUsername.c_str(), cfg.webPassword.c_str());
+    Serial.println("[AUTH] RF TX remains blocked until the default web password is changed");
+  }
+  if (changed) saveConfig();
+}
+
+static bool requireWebAuth() {
+  if (server.authenticate(cfg.webUsername.c_str(), cfg.webPassword.c_str())) return true;
+  server.requestAuthentication(BASIC_AUTH, "PocketDAPNET");
+  return false;
+}
+
+static bool constantTimeEquals(const String &a, const String &b) {
+  const size_t maxLen = max(a.length(), b.length());
+  uint8_t diff = (uint8_t)(a.length() ^ b.length());
+  for (size_t i = 0; i < maxLen; ++i) {
+    const uint8_t av = i < a.length() ? (uint8_t)a[i] : 0;
+    const uint8_t bv = i < b.length() ? (uint8_t)b[i] : 0;
+    diff |= av ^ bv;
+  }
+  return diff == 0;
+}
+
+static bool apiAuthorized() {
+  if (!cfg.apiEnabled || cfg.apiToken.length() < 16) return false;
+  if (!server.hasHeader("Authorization")) return false;
+  const String auth = server.header("Authorization");
+  const String expected = "Bearer " + cfg.apiToken;
+  return constantTimeEquals(auth, expected);
+}
+
+static String stationIdCallsign() {
+  String call = cfg.dapnetCallsign;
+  call.trim(); call.toUpperCase();
+  return call;
+}
+
+static void processStationIdentification() {
+  // Automatic station identification is only relevant while operating as a
+  // DAPNET transmitter. In RX-only operation PocketDAPNET must never key TX.
+  if (!cfg.dapnetEnabled) return;
+  if (!cfg.stationIdEnabled || txBlocked()) return;
+  String call = stationIdCallsign();
+  if (!call.length()) return;
+  const uint32_t intervalMs = (uint32_t)cfg.stationIdIntervalMin * 60UL * 1000UL;
+  if (!lastStationIdMillis) lastStationIdMillis = millis();
+  uint32_t dueMs = intervalMs;
+  // Give the DAPNET core a short grace period to deliver its regular RIC-8 ID
+  // before generating a local fallback, avoiding duplicate identification pages.
+  if (cfg.dapnetEnabled && dapnet.isOnline()) dueMs += 30000UL;
+  if ((uint32_t)(millis() - lastStationIdMillis) < dueMs || stationIdQueued) return;
+
+  // Queue the local fallback ID so it uses the assigned DAPNET timeslot.
+  if (!dapnet.isOnline()) return;
+  DapnetMessage id;
+  id.type = 6; id.speedCode = 1; id.ric = DEFAULT_STATION_ID_RIC;
+  id.function = 3; id.text = call;
+  if (enqueueDapnetMessage(id)) {
+    stationIdQueued = true;
+    addDebugLog("ID", "local fallback identification queued: " + call);
+  }
+}
+
 // Web UI
 static String checked(bool b) { return b ? " checked" : ""; }
 static String selected(const String &value, const char *candidate) { return value == candidate ? " selected" : ""; }
@@ -999,14 +1470,15 @@ static String pageHeader(const String &title) {
   String h;
   h.reserve(5000);
   h += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
+  h += "<meta name='csrf-token' content='" + htmlEscape(csrfToken) + "'>";
   h += "<title>" + htmlEscape(title) + F("</title><style>");
-  h += F("body{font-family:system-ui,sans-serif;max-width:980px;margin:0 auto;padding:0 14px 30px;background:#101114;color:#eee}header{display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:#101114;padding:14px 0;z-index:10;border-bottom:1px solid #333}h1{font-size:1.25rem;margin:0}.headStatus{font-size:.82rem;color:#bbb;margin-left:12px;white-space:nowrap}.brand{display:flex;align-items:center;min-width:0}details.menu{position:relative}details.menu summary{list-style:none;font-size:1.7rem;cursor:pointer;padding:2px 10px}details.menu nav{position:absolute;right:0;top:42px;min-width:190px;background:#202228;border:1px solid #444;border-radius:8px;padding:8px;box-shadow:0 8px 24px #0008}details.menu a{display:block;color:#fff;text-decoration:none;padding:10px;border-radius:5px}details.menu a:hover{background:#333}fieldset,.card{margin:16px 0;padding:16px;border:1px solid #45474f;border-radius:9px;background:#181a1f}label{display:block;margin:9px 0 3px}input,select,textarea,button{box-sizing:border-box;width:100%;padding:9px;border-radius:5px;border:1px solid #60636d;background:#22252b;color:#eee}button{cursor:pointer;font-weight:600}.topActions{display:flex;align-items:center;gap:8px}.rebootBtn{width:auto;padding:7px 10px;background:#5b2020;border-color:#8a3a3a}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.statusgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.metric{padding:12px;background:#202228;border-radius:7px}.metric small{display:block;color:#aaa}.notice{margin-top:12px;padding:10px;background:#263238;border-radius:6px}.msg{padding:10px 0;border-bottom:1px solid #333}.msg:last-child{border-bottom:0}.msg.new{animation:flash 1.4s ease}.meta{color:#aaa;font-size:.85rem}.ok{color:#9ee6a8}@keyframes flash{0%{background:#38533a}100%{background:transparent}}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid #333;vertical-align:top}small{color:#aaa}@media(max-width:700px){.grid,.statusgrid{grid-template-columns:1fr}table{font-size:.85rem}}");
-  h += "</style></head><body><header><div class='brand'><h1>PocketDAPNET</h1><span class='headStatus'><b>v" + String(POCKETDAPNET_VERSION) + " by DM1PWN</b> &middot; <span id='headTime'>" + htmlEscape(currentLocalTime()) + "</span> &middot; <span id='headSource'>" + htmlEscape(lastTimeSource) + "</span></span></div><div class='topActions'><details class='menu'><summary aria-label='Menu'>&#9776;</summary><nav><a href='/'>Dashboard</a><a href='/messages'>Messages</a><a href='/settings'>Settings</a><a href='/nvs'>NVS / Config</a><a href='/debug'>Debug log</a><a href='/status'>Status JSON</a></nav></details><form method='post' action='/reboot' onsubmit=\"return confirm('Reboot PocketDAPNET now?')\"><button class='rebootBtn' type='submit'>Reboot</button></form></div></header>";
+  h += F("body{font-family:system-ui,sans-serif;max-width:980px;margin:0 auto;padding:0 14px 30px;background:#101114;color:#eee}header{display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:#101114;padding:14px 0;z-index:10;border-bottom:1px solid #333}h1{font-size:1.25rem;margin:0}.headStatus{font-size:.82rem;color:#bbb;margin-left:12px;white-space:nowrap}.brand{display:flex;align-items:center;min-width:0}details.menu{position:relative}details.menu summary{list-style:none;font-size:1.7rem;cursor:pointer;padding:2px 10px}details.menu nav{position:absolute;right:0;top:42px;min-width:190px;background:#202228;border:1px solid #444;border-radius:8px;padding:8px;box-shadow:0 8px 24px #0008}details.menu a{display:block;color:#fff;text-decoration:none;padding:10px;border-radius:5px}details.menu a:hover{background:#333}fieldset,.card{margin:16px 0;padding:16px;border:1px solid #45474f;border-radius:9px;background:#181a1f}label{display:block;margin:9px 0 3px}input,select,textarea,button{box-sizing:border-box;width:100%;padding:9px;border-radius:5px;border:1px solid #60636d;background:#22252b;color:#eee}button{cursor:pointer;font-weight:600}.topActions{display:flex;align-items:center;gap:8px}.rebootBtn{width:auto;padding:7px 10px;background:#5b2020;border-color:#8a3a3a}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.statusgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.metric{padding:12px;background:#202228;border-radius:7px}.metric small{display:block;color:#aaa}.notice{margin-top:12px;padding:10px;background:#263238;border-radius:6px}.msg{padding:10px 0;border-bottom:1px solid #333}.msg:last-child{border-bottom:0}.msg.new{animation:flash 1.4s ease}.meta{color:#aaa;font-size:.85rem}.ok{color:#9ee6a8}.bad{color:#ff9b9b}@keyframes flash{0%{background:#38533a}100%{background:transparent}}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid #333;vertical-align:top}small{color:#aaa}@media(max-width:700px){.grid,.statusgrid{grid-template-columns:1fr}table{font-size:.85rem}}");
+  h += "</style></head><body><header><div class='brand'><h1>PocketDAPNET</h1><span class='headStatus'><b>v" + String(POCKETDAPNET_VERSION) + " by DM1PWN <small>(" + String(POCKETDAPNET_BUILD_ID) + ")</small></b> &middot; <span id='headTime'>" + htmlEscape(currentLocalTime()) + "</span> &middot; <span id='headSource'>" + htmlEscape(lastTimeSource) + "</span></span></div><div class='topActions'><details class='menu'><summary aria-label='Menu'>&#9776;</summary><nav><a href='/'>Dashboard</a><a href='/messages'>Messages</a><a href='/settings'>Settings</a><a href='/nvs'>NVS / Config</a><a href='/debug'>Debug log</a><a href='/status'>Status JSON</a></nav></details><form method='post' action='/reboot' onsubmit=\"return confirm('Reboot PocketDAPNET now?')\"><button class='rebootBtn' type='submit'>Reboot</button></form></div></header>";
   return h;
 }
 
 static String pageFooter() {
-  return F("<script>async function refreshHeader(){try{let s=await (await fetch('/status',{cache:'no-store'})).json();let t=document.getElementById('headTime'),q=document.getElementById('headSource');if(t)t.textContent=s.localTime;if(q)q.textContent=s.timeSource;}catch(e){}}refreshHeader();setInterval(refreshHeader,1500);</script></body></html>");
+  return F("<script>(()=>{const m=document.querySelector('meta[name=csrf-token]'),t=m?m.content:'';document.querySelectorAll('form').forEach(f=>{if((f.method||'').toLowerCase()==='post'&&!f.querySelector('input[name=csrf]')){let i=document.createElement('input');i.type='hidden';i.name='csrf';i.value=t;f.appendChild(i);}});})();async function refreshHeader(){try{let s=await (await fetch('/status',{cache:'no-store'})).json();let t=document.getElementById('headTime'),q=document.getElementById('headSource');if(t)t.textContent=s.localTime;if(q)q.textContent=s.timeSource;}catch(e){console.error('PocketDAPNET header refresh failed:',e);}}refreshHeader();setInterval(refreshHeader,2500);</script></body></html>");
 }
 
 static String buildDashboard(const String &notice = "") {
@@ -1014,11 +1486,11 @@ static String buildDashboard(const String &notice = "") {
   if (notice.length()) h += "<div class='notice'>" + htmlEscape(notice) + "</div>";
   h += F("<div class='statusgrid'>");
   h += "<div class='metric'><small>Network</small><span id='stWifi'>" + htmlEscape(ipInfo()) + "</span></div>";
-  h += "<div class='metric'><small>Radio</small><span id='stRadio'>" + String(receiverRunning ? "RX active" : "RX idle") + (cfg.txInhibit ? " / TX INHIBITED" : " / TX ready") + "</span></div>";
+  h += "<div class='metric'><small>Radio</small><span id='stRadio'>" + String(receiverRunning ? "RX active" : "RX idle") + (txBlocked() ? " / TX INHIBITED" : " / TX ready") + "</span></div>";
   h += "<div class='metric'><small>GPS / Time</small><span id='stGps'>" + String(gpsHasFix ? "FIX" : "no fix") + " / " + htmlEscape(lastTimeSource) + "</span></div></div>";
 
   h += F("<div class='card'><h2>Manual POCSAG send</h2>");
-  if (cfg.txInhibit) h += F("<div class='notice'>TX INHIBIT is active. All RF transmission is blocked.</div>");
+  if (txBlocked()) h += F("<div class='notice'>RF TX is blocked. Clear TX Inhibit and change the default web password before transmitting.</div>");
   h += F("<form method='post' action='/send'>");
   h += "<label>Destination RIC</label><input name='ric' value='" + String(cfg.ownRic) + "'>";
   h += F("<label>Message</label><textarea name='msg' rows='4' required></textarea><button type='submit'>Send message</button></form>");
@@ -1036,22 +1508,21 @@ static String buildDashboard(const String &notice = "") {
 
   h += F("<div class='card'><h2>Recent received messages</h2><div id='recentMessages'><p><small>Loading...</small></p></div>");
   h += F("<p><a href='/messages' style='color:#9ecbff'>Show full message history</a></p></div>");
-  h += F("<script>let lastSeq=0;function esc(s){return String(s == null ? '' : s).replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));}async function refresh(){try{let st=await (await fetch('/status',{cache:'no-store'})).json();document.getElementById('headTime').textContent=st.localTime;document.getElementById('headSource').textContent=st.timeSource;document.getElementById('stWifi').textContent=st.wifi;document.getElementById('stRadio').textContent=(st.receiverRunning?'RX active':'RX idle')+(st.txInhibit?' / TX INHIBITED':' / TX ready');document.getElementById('stGps').textContent=(st.gpsFix?('FIX '+st.gpsLat.toFixed(5)+', '+st.gpsLon.toFixed(5)+' / '):'no fix ')+(st.gpsSatellites||0)+' sat / '+st.timeSource;document.getElementById('stTx').textContent=st.lastTxStatus;document.getElementById('stDapnet').textContent=st.dapnetStatus;document.getElementById('stCfgSlots').textContent=st.dapnetConfiguredSlots;document.getElementById('stSrvSlots').textContent=st.dapnetServerSlots;document.getElementById('stEffSlots').textContent=st.dapnetEffectiveSlots;document.getElementById('stDQueue').textContent=st.dapnetQueue;document.getElementById('stDSlot').textContent=(st.dapnetCurrentSlot<0?'--':st.dapnetCurrentSlotHex+' / '+st.dapnetSlotElapsedMs+' ms');document.getElementById('stDReason').textContent=st.dapnetSchedulerReason;document.getElementById('stSysTime').textContent=st.localTime;document.getElementById('stTimeSync').textContent=st.timeSynchronized?'synchronized':'UNSYNCED';document.getElementById('stTimeSource').textContent=st.timeSource;document.getElementById('stDapTime').textContent=st.dapnetMasterTimeRaw;document.getElementById('stDapCorr').textContent=st.dapnetClockCorrectionRaw;let m=await (await fetch('/api/messages?limit=8',{cache:'no-store'})).json();let box=document.getElementById('recentMessages');if(!m.messages.length){box.innerHTML='<p><small>No messages received since boot.</small></p>';return;}let newest=m.messages[0].sequence;box.innerHTML=m.messages.map((x,i)=>`<div class='msg ${newest>lastSeq&&i==0?'new':''}'><div class='meta'>#${x.sequence} &middot; ${esc(x.time)} &middot; RIC ${x.ric} &middot; ${x.rssi.toFixed(1)} dBm ${x.configuredRic?'&middot; <span class=ok>listed RIC</span>':''}</div><div>${esc(x.message)}</div></div>`).join('');lastSeq=Math.max(lastSeq,newest);}catch(e){}}refresh();setInterval(refresh,1500);</script>");
+  h += F("<script>let lastSeq=0;function esc(s){return String(s == null ? '' : s).replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));}async function refresh(){try{let st=await (await fetch('/status',{cache:'no-store'})).json();document.getElementById('headTime').textContent=st.localTime;document.getElementById('headSource').textContent=st.timeSource;document.getElementById('stWifi').textContent=st.wifi;document.getElementById('stRadio').textContent=(st.receiverRunning?'RX active':'RX idle')+(st.txBlocked?' / TX INHIBITED':' / TX ready');document.getElementById('stGps').textContent=(st.gpsFix?('FIX '+st.gpsLat.toFixed(5)+', '+st.gpsLon.toFixed(5)+' / '):'no fix ')+(st.gpsSatellites||0)+' sat / '+st.timeSource;document.getElementById('stTx').textContent=st.lastTxStatus;document.getElementById('stDapnet').textContent=st.dapnetStatus;document.getElementById('stCfgSlots').textContent=st.dapnetConfiguredSlots;document.getElementById('stSrvSlots').textContent=st.dapnetServerSlots;document.getElementById('stEffSlots').textContent=st.dapnetEffectiveSlots;document.getElementById('stDQueue').textContent=st.dapnetQueue;document.getElementById('stDSlot').textContent=(st.dapnetCurrentSlot<0?'--':st.dapnetCurrentSlotHex+' / '+st.dapnetSlotElapsedMs+' ms');document.getElementById('stDReason').textContent=st.dapnetSchedulerReason;document.getElementById('stSysTime').textContent=st.localTime;document.getElementById('stTimeSync').textContent=st.timeSynchronized?'synchronized':'UNSYNCED';document.getElementById('stTimeSource').textContent=st.timeSource;document.getElementById('stDapTime').textContent=st.dapnetMasterTimeRaw;document.getElementById('stDapCorr').textContent=st.dapnetClockCorrectionRaw;let m=await (await fetch('/api/messages?limit=8',{cache:'no-store'})).json();let box=document.getElementById('recentMessages');if(!m.messages.length){box.innerHTML='<p><small>No messages received since boot.</small></p>';return;}let newest=m.messages[0].sequence;box.innerHTML=m.messages.map((x,i)=>`<div class='msg ${newest>lastSeq&&i==0?'new':''}'><div class='meta'>#${x.sequence} &middot; ${esc(x.time)} &middot; RIC ${x.ric} &middot; ${x.rssi.toFixed(1)} dBm ${x.configuredRic?'&middot; <span class=ok>listed RIC</span>':''}</div><div>${esc(x.message)}</div></div>`).join('');lastSeq=Math.max(lastSeq,newest);}catch(e){console.error('PocketDAPNET dashboard refresh failed:',e);let box=document.getElementById('recentMessages');if(box)box.innerHTML='<p class=\"bad\">Failed to load message history.</p>';}}refresh();setInterval(refresh,2500);</script>");
   return h + pageFooter();
 }
 
 static String buildMessages() {
-  String h = pageHeader("Received Messages");
-  h += F("<div class='card'><h2>Received messages <span id='msgCount'></span></h2><div id='messageTable'>Loading...</div>");
-  h += F("<form method='post' action='/messages/clear' style='margin-top:16px'><button type='submit'>Clear message history</button></form></div>");
-  h += F("<script>let lastSeq=0;function esc(s){return String(s == null ? '' : s).replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));}async function refreshMessages(){try{let d=await (await fetch('/api/messages',{cache:'no-store'})).json();document.getElementById('msgCount').textContent='('+d.messages.length+')';let b=document.getElementById('messageTable');if(!d.messages.length){b.innerHTML='<p>No messages received since boot.</p>';return;}let newest=d.messages[0].sequence;b.innerHTML='<table><thead><tr><th>#</th><th>Time</th><th>RIC</th><th>RSSI</th><th>Message</th></tr></thead><tbody>'+d.messages.map((x,i)=>`<tr class='${newest>lastSeq&&i==0?'new':''}'><td>${x.sequence}</td><td>${esc(x.time)}</td><td>${x.ric}${x.configuredRic?' *':''}</td><td>${x.rssi.toFixed(1)}</td><td>${esc(x.message)}</td></tr>`).join('')+'</tbody></table>';lastSeq=Math.max(lastSeq,newest);}catch(e){}}refreshMessages();setInterval(refreshMessages,1500);</script>");
-  return h + pageFooter();
+  String h=pageHeader("Message History");
+  h+=F("<div class='card'><h2>Message history</h2><p><small>Up to 30 RX, TX and DAPNET entries are persisted across reboots.</small></p><div class='grid'><button type='button' onclick=\"showHistory('rx')\">Received</button><button type='button' onclick=\"showHistory('tx')\">Transmitted</button><button type='button' onclick=\"showHistory('dapnet')\">DAPNET</button></div><h3 id='histTitle'>Received</h3><div id='messageTable'>Loading...</div><form method='post' action='/messages/clear' style='margin-top:16px' onsubmit=\"return confirm('Clear all persistent message histories?')\"><button type='submit'>Clear all history</button></form></div>");
+  h+=F("<script>let ht='rx',lastSeq=0;function esc(s){return String(s==null?'':s).replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));}async function showHistory(t){ht=t;lastSeq=0;document.getElementById('histTitle').textContent=t==='rx'?'Received':t==='tx'?'Transmitted':'DAPNET';await refreshMessages();}async function refreshMessages(){try{let d=await(await fetch('/api/history?type='+encodeURIComponent(ht),{cache:'no-store'})).json(),b=document.getElementById('messageTable');if(!d.messages.length){b.innerHTML='<p>No stored messages.</p>';return;}let newest=d.messages[0].sequence;b.innerHTML='<table><thead><tr><th>#</th><th>Time</th><th>RIC</th><th>Source / status</th><th>Message</th></tr></thead><tbody>'+d.messages.map((x,i)=>`<tr class='${newest>lastSeq&&i===0?'new':''}'><td>${x.sequence}</td><td>${esc(x.time)}</td><td>${x.ric}</td><td>${esc(x.source)}<br><small>${esc(x.status)}${x.baud?' / '+x.baud+' baud':''}</small></td><td>${esc(x.message)}</td></tr>`).join('')+'</tbody></table>';lastSeq=Math.max(lastSeq,newest);}catch(e){console.error('PocketDAPNET history refresh failed:',e);document.getElementById('messageTable').innerHTML='<p class=bad>Failed to load message history.</p>';}}refreshMessages();setInterval(refreshMessages,2500);</script>");
+  return h+pageFooter();
 }
 
 static String buildDebugPage() {
   String h = pageHeader("Debug log");
   h += F("<div class='card'><h2>Runtime debug log</h2><p><small>Event-based ring buffer. It logs DAPNET frames, queue changes, scheduler decisions and RF TX events; it does not log ISR/bit-level traffic.</small></p><div style='display:flex;gap:10px'><form method='post' action='/debug/clear'><button type='submit'>Clear log</button></form><button onclick=\"refreshLog()\">Refresh</button></div><pre id='debugText' style='white-space:pre-wrap;overflow-wrap:anywhere;background:#0b0c0e;padding:12px;border-radius:7px;max-height:70vh;overflow:auto'>Loading...</pre></div>");
-  h += F("<script>async function refreshLog(){try{let d=await (await fetch('/api/debug',{cache:'no-store'})).json();document.getElementById('debugText').textContent=d.lines.join('\\n');}catch(e){}}refreshLog();setInterval(refreshLog,1500);</script>");
+  h += F("<script>async function refreshLog(){try{let d=await (await fetch('/api/debug',{cache:'no-store'})).json();document.getElementById('debugText').textContent=d.lines.join('\\n');}catch(e){console.error('PocketDAPNET debug refresh failed:',e);}}refreshLog();setInterval(refreshLog,1500);</script>");
   return h + pageFooter();
 }
 
@@ -1062,9 +1533,9 @@ static String buildSettings(const String &notice = "") {
   h += "<option value='client'" + selected(cfg.wifiMode,"client") + ">Client (fallback AP on failure)</option>";
   h += "<option value='ap'" + selected(cfg.wifiMode,"ap") + ">Access Point</option></select>";
   h += "<label>Client SSID</label><input name='wssid' value='" + htmlEscape(cfg.staSsid) + "'>";
-  h += "<label>Client password</label><input type='password' name='wpass' value='" + htmlEscape(cfg.staPassword) + "'>";
+  h += "<label>Client password</label><input type='password' name='wpass' value='' placeholder='leave blank to keep current'>";
   h += "<label>AP SSID</label><input name='apssid' value='" + htmlEscape(cfg.apSsid) + "'>";
-  h += "<label>AP password</label><input type='password' name='appass' value='" + htmlEscape(cfg.apPassword) + "'></fieldset>";
+  h += "<label>AP password</label><input type='password' name='appass' value='' placeholder='leave blank to keep current'></fieldset>";
 
   h += F("<fieldset><legend>POCSAG / Radio</legend><div class='grid'>");
   h += "<div><label>TX Inhibit</label><label><input style='width:auto' type='checkbox' name='txinhib' value='1'" + checked(cfg.txInhibit) + "> Disable all RF transmission</label><small>Safety interlock. RX remains active. Enable before disconnecting or changing the antenna/RF cabling.</small></div>";
@@ -1080,6 +1551,29 @@ static String buildSettings(const String &notice = "") {
   h += "<label><input style='width:auto' type='checkbox' name='invert' value='1'" + checked(cfg.invert) + "> Invert FSK polarity</label>";
   h += "<label><input style='width:auto' type='checkbox' name='debugall' value='1'" + checked(cfg.debugAllRics) + "> Debug RX: receive all RICs</label><small>Promiscuous POCSAG receive. Every decoded RIC is shown and stored in message history.</small>";
   h += "<label>Receive RIC list</label><textarea name='rxrics' rows='5'>" + htmlEscape(cfg.rxRics) + "</textarea><small>Comma, semicolon or newline separated; max. 32 exact RICs.</small></fieldset>";
+
+  h += F("<fieldset><legend>Web / API security</legend>");
+  h += "<div class='grid'><div><label>Web username</label><input name='webuser' value='" + htmlEscape(cfg.webUsername) + "'></div>";
+  h += "<div><label>New web password</label><input type='password' name='webpass' value='' placeholder='leave blank to keep current'><small>HTTP Basic Authentication protects the complete web UI.</small></div></div>";
+  h += "<label><input style='width:auto' type='checkbox' name='apien' value='1'" + checked(cfg.apiEnabled) + "> Enable send API</label>";
+  h += "<label>API bearer token</label>"
+       "<div style='display:flex;gap:8px'>"
+       "<input id='apitoken' type='password' name='apitoken' value='' placeholder='leave blank to keep current'>"
+       "<button type='button' style='width:auto' "
+       "onclick=\"let a='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789',"
+       "b=new Uint32Array(24);"
+       "crypto.getRandomValues(b);"
+       "document.getElementById('apitoken').value="
+       "Array.from(b,x=>a[x%a.length]).join('')\">"
+       "Generate</button>"
+       "</div>"
+       "<small>Minimum 16 characters. POST /api/send uses Authorization: Bearer &lt;token&gt;.</small>";
+  h += F("</fieldset>");
+
+  h += F("<fieldset><legend>Station identification</legend>");
+  h += "<label><input style='width:auto' type='checkbox' name='idenable' value='1'" + checked(cfg.stationIdEnabled) + "> Enable local callsign identification fallback</label>";
+  h += "<label>Interval (minutes)</label><input name='idint' type='number' min='1' max='60' value='" + String(cfg.stationIdIntervalMin) + "'><small>Uses DAPNET callsign and RIC 8. A received/sent DAPNET RIC-8 identification with the same callsign resets the timer, avoiding duplicate beacons.</small>";
+  h += F("</fieldset>");
 
   h += F("<fieldset><legend>System / LED</legend>");
   h += "<label>Status LED mode</label><select name='ledmode'><option value='off'" + selected(cfg.ledMode,"off") + ">Off</option><option value='notifications'" + selected(cfg.ledMode,"notifications") + ">Notifications only</option><option value='status'" + selected(cfg.ledMode,"status") + ">Status + notifications</option></select>";
@@ -1101,7 +1595,7 @@ static String buildSettings(const String &notice = "") {
   h += "<div class='grid'><div><label>Server</label><input name='dhost' value='" + htmlEscape(cfg.dapnetHost) + "'></div>";
   h += "<div><label>Port</label><input name='dport' value='" + String(cfg.dapnetPort) + "'></div>";
   h += "<div><label>Callsign / Node</label><input name='dcall' value='" + htmlEscape(cfg.dapnetCallsign) + "'></div>";
-  h += "<div><label>Auth key</label><input type='password' name='dkey' value='" + htmlEscape(cfg.dapnetAuthKey) + "'></div>";
+  h += "<div><label>Auth key</label><input type='password' name='dkey' value='' placeholder='leave blank to keep current'></div>";
   h += "<div><label>Assigned timeslots</label><input name='dslots' maxlength='16' value='" + htmlEscape(cfg.dapnetTimeslots) + "'><small>Hex slot list from DAPNET registration, e.g. 159D.</small></div></div>";
   h += F("<small>RF transmission is permitted only in the intersection of configured and server-assigned timeslots. If no valid server schedule is received, DAPNET RF TX remains blocked.</small></fieldset>");
   h += F("<button type='submit'>Save configuration and reboot</button></form><form method='post' action='/reboot' style='margin-top:14px'><button type='submit'>Reboot without changes</button></form>");
@@ -1120,39 +1614,55 @@ static String buildNvsPage() {
   auto row = [&](const String &key, const String &value) { h += "<tr><td>" + htmlEscape(key) + "</td><td>" + htmlEscape(value) + "</td></tr>"; };
   row("wmode", cfg.wifiMode); row("wssid", cfg.staSsid); row("wpass", maskedSecret(cfg.staPassword));
   row("apssid", cfg.apSsid); row("appass", maskedSecret(cfg.apPassword));
-  row("txinhib", cfg.txInhibit ? "true" : "false");
+  row("txinhib", cfg.txInhibit ? "true" : "false"); row("defaultWebPassword", webUsesDefaultPassword() ? "true" : "false");
+  row("webuser", cfg.webUsername); row("webpass", maskedSecret(cfg.webPassword));
+  row("apien", cfg.apiEnabled ? "true" : "false"); row("apitoken", maskedSecret(cfg.apiToken));
+  row("idenable", cfg.stationIdEnabled ? "true" : "false"); row("idint", String(cfg.stationIdIntervalMin));
   row("freq", String(cfg.frequencyMHz, 6)); row("rxcorr", String(cfg.rxCorrectionMHz, 6)); row("txcorr", String(cfg.txCorrectionMHz, 6));
   row("baud", String(cfg.baud)); row("shift", String(cfg.shiftHz)); row("txpwr", String(cfg.txPowerDbm)); row("invert", cfg.invert ? "true" : "false");
   row("ownric", String(cfg.ownRic)); row("rxrics", cfg.rxRics); row("debugall", cfg.debugAllRics ? "true" : "false"); row("ledmode", cfg.ledMode);
   row("ntpprov", cfg.ntpProvider); row("ntpcustom", cfg.ntpCustomServer);
   row("denable", cfg.dapnetEnabled ? "true" : "false"); row("dhost", cfg.dapnetHost); row("dport", String(cfg.dapnetPort));
   row("dcall", cfg.dapnetCallsign); row("dkey", maskedSecret(cfg.dapnetAuthKey)); row("dslots", cfg.dapnetTimeslots);
-  h += F("</tbody></table><p><small>Runtime-only queues, message history and debug logs are stored in RAM and are not part of NVS.</small></p></div>");
+  h += F("</tbody></table><p><small>DAPNET transmit queue and debug log are RAM-only. RX/TX/DAPNET histories are stored in bounded LittleFS ring buffers (30 entries each).</small></p></div>");
   h += F("<div class='card'><h2>Factory reset</h2><p>This erases the entire PocketDAPNET NVS namespace. After reboot the device starts with repository defaults and, without configured WiFi credentials, exposes the fallback setup AP.</p><form method='post' action='/factory-reset' onsubmit=\"return confirm('Factory reset PocketDAPNET? This cannot be undone.');\"><button type='submit' style='background:#8b1e1e'>Reset to factory defaults</button></form></div>");
   return h + pageFooter();
 }
 
-static void handleNvs() { server.send(200, "text/html; charset=utf-8", buildNvsPage()); }
+static void handleNvs(){sendHtml(200,buildNvsPage());}
 static void handleFactoryReset() {
   addDebugLog("SYSTEM", "factory reset requested");
   prefs.begin("tbdapnet", false);
   bool ok = prefs.clear();
   prefs.end();
-  server.send(200, "text/html; charset=utf-8", pageHeader("Factory reset") + String("<div class='notice'>") + (ok ? "NVS cleared. Rebooting into factory defaults..." : "NVS clear failed. Rebooting...") + "</div>" + pageFooter());
+  clearAllHistory();
+  sendHtml(200,pageHeader("Factory reset")+String("<div class='notice'>")+(ok?"NVS and persistent history cleared. Rebooting into factory defaults...":"NVS clear failed. Rebooting...")+"</div>"+pageFooter());
   delay(800);
   ESP.restart();
 }
 
-static void handleRoot() { server.send(200, "text/html; charset=utf-8", buildDashboard()); }
-static void handleMessages() { server.send(200, "text/html; charset=utf-8", buildMessages()); }
-static void handleSettings() { server.send(200, "text/html; charset=utf-8", buildSettings()); }
-static void handleDebug() { server.send(200, "text/html; charset=utf-8", buildDebugPage()); }
+static void handleRoot(){sendHtml(200,buildDashboard());}
+static void handleMessages(){sendHtml(200,buildMessages());}
+static void handleSettings(){sendHtml(200,buildSettings());}
+static void handleDebug(){sendHtml(200,buildDebugPage());}
 
 static void handleSave() {
+  String validationError=validateSettingsInput();
+  if(validationError.length()){sendHtml(400,buildSettings("Validation error: "+validationError));return;}
   cfg.wifiMode = server.arg("wmode") == "ap" ? "ap" : "client";
-  cfg.staSsid = server.arg("wssid"); cfg.staPassword = server.arg("wpass");
-  cfg.apSsid = server.arg("apssid"); cfg.apPassword = server.arg("appass");
+  cfg.staSsid = server.arg("wssid"); if(server.arg("wpass").length()) cfg.staPassword = server.arg("wpass");
+  cfg.apSsid = server.arg("apssid"); if(server.arg("appass").length()) cfg.apPassword = server.arg("appass");
   cfg.txInhibit = server.hasArg("txinhib");
+  cfg.webUsername = server.arg("webuser");
+  cfg.webUsername.trim(); if (!cfg.webUsername.length()) cfg.webUsername = DEFAULT_WEB_USERNAME;
+  if (server.arg("webpass").length()) cfg.webPassword = server.arg("webpass");
+  if (webUsesDefaultPassword()) cfg.txInhibit = true;
+  cfg.apiEnabled = server.hasArg("apien");
+  if (server.arg("apitoken").length()) cfg.apiToken = server.arg("apitoken");
+  if (cfg.apiEnabled && cfg.apiToken.length() < 16) cfg.apiEnabled = false;
+  cfg.stationIdEnabled = server.hasArg("idenable");
+  cfg.stationIdIntervalMin = (uint16_t)server.arg("idint").toInt();
+  if (cfg.stationIdIntervalMin < 1 || cfg.stationIdIntervalMin > 60) cfg.stationIdIntervalMin = DEFAULT_STATION_ID_INTERVAL_MIN;
   cfg.ownRic = parseRic(server.arg("ownric"));
   cfg.frequencyMHz = server.arg("freq").toFloat();
   cfg.rxCorrectionMHz = server.arg("rxcorr").toFloat();
@@ -1174,63 +1684,72 @@ static void handleSave() {
   cfg.dapnetEnabled = server.hasArg("denable");
   cfg.dapnetHost = server.arg("dhost");
   cfg.dapnetPort = (uint16_t)server.arg("dport").toInt();
-  cfg.dapnetCallsign = server.arg("dcall"); cfg.dapnetAuthKey = server.arg("dkey");
+  cfg.dapnetCallsign = server.arg("dcall"); if(server.arg("dkey").length()) cfg.dapnetAuthKey = server.arg("dkey");
   cfg.dapnetTimeslots = normalizeDapnetTimeslots(server.arg("dslots"));
   if (!cfg.dapnetTimeslots.length()) cfg.dapnetTimeslots = DEFAULT_DAPNET_TIMESLOTS;
   saveConfig();
-  server.send(200, "text/html; charset=utf-8", buildSettings("Configuration saved. Rebooting..."));
+  sendHtml(200,buildSettings("Configuration saved. Rebooting..."));
   delay(500); ESP.restart();
 }
 
 static void handleSend() {
-  uint32_t ric = parseRic(server.arg("ric"));
-  String msg = server.arg("msg");
-  bool ok = sendPocsag(ric, msg);
-  server.send(ok ? 200 : 500, "text/html; charset=utf-8", buildDashboard(ok ? "POCSAG message transmitted." : "POCSAG transmission failed: " + lastTxStatus));
+  uint32_t ric=0;String msg=server.arg("msg");
+  if(!parseRicStrict(server.arg("ric"),ric)||!printableAscii(msg,240)){sendHtml(400,buildDashboard("Invalid RIC or message. Use 1-240 printable ASCII characters."));return;}
+  bool ok=sendPocsag(ric,msg);sendHtml(ok?200:500,buildDashboard(ok?"POCSAG message transmitted.":"POCSAG transmission failed: "+lastTxStatus));
 }
 
-static void handleMessagesApi() {
-  int limit = server.hasArg("limit") ? server.arg("limit").toInt() : (int)rxHistoryCount;
-  if (limit <= 0 || limit > (int)rxHistoryCount) limit = (int)rxHistoryCount;
-  String json = "{\"messages\":[";
-  for (int i = 0; i < limit; i++) {
-    const RxHistoryEntry *e = historyNewest((size_t)i);
-    if (i) json += ',';
-    String timeText = e->timeValid ? formatLocalTime(e->receivedAt) : (String("uptime ") + formatUptime(e->uptimeSeconds));
-    json += "{\"sequence\":" + String(e->sequence);
-    json += ",\"time\":\"" + jsonEscape(timeText) + "\"";
-    json += ",\"ric\":" + String(e->ric);
-    json += ",\"rssi\":" + String(e->rssi,1);
-    json += ",\"configuredRic\":" + String(e->configuredRic ? "true" : "false");
-    json += ",\"message\":\"" + jsonEscape(e->message) + "\"}";
-  }
-  json += "]}";
-  server.send(200, "application/json", json);
+static void handleSendApi() {
+  if(!apiAuthorized()){sendJson(401,"{\"ok\":false,\"error\":\"unauthorized\"}");return;}
+  String contentType=server.header("Content-Type");if(!contentType.startsWith("application/x-www-form-urlencoded")){sendJson(415,"{\"ok\":false,\"error\":\"unsupported_media_type\"}");return;}
+  if(!apiRateAllowed()){server.sendHeader("Retry-After","10");sendJson(429,"{\"ok\":false,\"error\":\"rate_limited\"}");return;}
+  if(txBlocked()){sendJson(423,"{\"ok\":false,\"error\":\"tx_inhibited\"}");return;}
+  uint32_t ric=0;String msg=server.arg("message");if(!msg.length())msg=server.arg("msg");
+  if(!parseRicStrict(server.arg("ric"),ric)||!printableAscii(msg,240)){sendJson(400,"{\"ok\":false,\"error\":\"invalid_ric_or_message\"}");return;}
+  bool ok=sendPocsag(ric,msg);addDebugLog("API",String(ok?"TX success RIC=":"TX failed RIC=")+String(ric));
+  String body=String("{\"ok\":")+(ok?"true":"false")+",\"ric\":"+String(ric)+",\"status\":\""+jsonEscape(lastTxStatus)+"\"}";sendJson(ok?200:500,body);
 }
+
+static String historyTimeText(const HistoryEntry &e){return(e.flags&HISTORY_FLAG_TIME_VALID)?formatLocalTime((time_t)e.timestamp):(String("uptime ")+formatUptime(e.uptimeSeconds));}
+static void appendHistoryJson(String &j,const HistoryEntry &e,const char *kind){j+="{\"sequence\":"+String(e.sequence)+",\"time\":\""+jsonEscape(historyTimeText(e))+"\",\"ric\":"+String(e.ric)+",\"rssi\":"+String((float)e.rssi10/10.0f,1)+",\"configuredRic\":"+String((e.flags&HISTORY_FLAG_CONFIGURED)?"true":"false")+",\"success\":"+String((e.flags&HISTORY_FLAG_SUCCESS)?"true":"false")+",\"baud\":"+String(e.baud)+",\"txPowerDbm\":"+String(e.txPowerDbm)+",\"type\":"+String(e.type)+",\"function\":"+String(e.function)+",\"speedCode\":"+String(e.speedCode)+",\"source\":\""+jsonEscape(String(e.source))+"\",\"status\":\""+jsonEscape(String(e.status))+"\",\"message\":\""+jsonEscape(displaySafeText(String(e.message)))+"\",\"kind\":\""+String(kind)+"\"}";}
+static void handleHistoryApi(String type){const HistoryEntry *a=rxHistory;size_t h=rxHistoryHead,c=rxHistoryCount;const char *kind="rx";if(type=="tx"){a=txHistory;h=txHistoryHead;c=txHistoryCount;kind="tx";}else if(type=="dapnet"){a=dapnetHistory;h=dapnetHistoryHead;c=dapnetHistoryCount;kind="dapnet";}int lim=server.hasArg("limit")?server.arg("limit").toInt():(int)c;if(lim<=0||lim>(int)c)lim=(int)c;String j;j.reserve(1024+lim*180);j="{\"type\":\""+String(kind)+"\",\"messages\":[";for(int i=0;i<lim;++i){const HistoryEntry *e=historyNewest(a,h,c,(size_t)i);if(!e)continue;if(i)j+=',';appendHistoryJson(j,*e,kind);}j+="]}";sendJson(200,j);}
+
+static void handleMessagesApi(){handleHistoryApi("rx");}
 
 static void handleDebugApi() {
-  String json = "{\"lines\":[";
+  String json;
+  json.reserve(4096);
+  json = "{\"lines\":[";
   for (size_t i = 0; i < debugLogCount; ++i) {
     size_t idx = (debugLogHead + DEBUG_LOG_SIZE - debugLogCount + i) % DEBUG_LOG_SIZE;
     if (i) json += ',';
     json += "\"" + jsonEscape(debugLogLines[idx]) + "\"";
   }
   json += "]}";
-  server.send(200, "application/json", json);
+  sendJson(200,json);
 }
 
 static void handleStatus() {
-  String json = "{";
+  String json;
+  json.reserve(2300);
+  json = "{";
   json += "\"version\":\"" + String(POCKETDAPNET_VERSION) + "\",";
+  json += "\"buildId\":\"" + jsonEscape(String(POCKETDAPNET_BUILD_ID)) + "\",";
   json += "\"wifi\":\"" + jsonEscape(ipInfo()) + "\",";
   json += "\"receiverRunning\":" + String(receiverRunning ? "true" : "false") + ",";
   json += "\"txInhibit\":" + String(cfg.txInhibit ? "true" : "false") + ",";
+  json += "\"txBlocked\":" + String(txBlocked() ? "true" : "false") + ",";
+  json += "\"defaultWebPassword\":" + String(webUsesDefaultPassword() ? "true" : "false") + ",";
+  json += "\"apiEnabled\":" + String(cfg.apiEnabled ? "true" : "false") + ",";
+  json += "\"stationIdEnabled\":" + String(cfg.stationIdEnabled ? "true" : "false") + ",";
   json += "\"rxRicCount\":" + String((unsigned)rxAddressCount) + ",";
   json += "\"debugAllRics\":" + String(cfg.debugAllRics ? "true" : "false") + ",";
   json += "\"rxDecodeCount\":" + String(rxDecodeCount) + ",";
   json += "\"rxRestartCount\":" + String(rxRestartCount) + ",";
   json += "\"lastRxState\":" + String(lastRxState) + ",";
   json += "\"historyCount\":" + String((unsigned)rxHistoryCount) + ",";
+  json += "\"txHistoryCount\":" + String((unsigned)txHistoryCount) + ",";
+  json += "\"dapnetHistoryCount\":" + String((unsigned)dapnetHistoryCount) + ",";
+  json += "\"littleFsAvailable\":" + String(littleFsAvailable?"true":"false") + ",";
   json += "\"txPowerDbm\":" + String(cfg.txPowerDbm) + ",";
   json += "\"lastRxRic\":" + String(lastRxRic) + ",";
   json += "\"lastRxRssi\":" + String(lastRxRssi,1) + ",";
@@ -1268,36 +1787,61 @@ static void handleStatus() {
   json += "\"dapnetTxFailCount\":" + String(dapnetTxFailCount) + ",";
   json += "\"dapnetDropCount\":" + String(dapnetDropCount) + ",";
   json += "\"dapnetLastRic\":" + String(dapnetLastRic) + ",";
-  json += "\"dapnetLastMessage\":\"" + jsonEscape(dapnetLastMessage) + "\"}";
-  server.send(200, "application/json", json);
+  json += "\"dapnetLastMessage\":\"" + jsonEscape(dapnetLastMessage) + "\",";
+  json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"minFreeHeap\":" + String(ESP.getMinFreeHeap()) + ",";
+  json += "\"maxAllocHeap\":" + String(ESP.getMaxAllocHeap()) + ",";
+  json += "\"loopLastMs\":" + String(loopLastMs) + ",";
+  json += "\"loopMaxMs\":" + String(loopMaxMs) + ",";
+  json += "\"loopCounter\":" + String(loopCounter) + ",";
+  json += "\"healthStage\":\"" + jsonEscape(String(healthLastStage)) + "\",";
+  json += "\"previousHealthStage\":\"" + jsonEscape(bootPreviousStage) + "\",";
+  json += "\"resetReason\":" + String((int)esp_reset_reason()) + "}";
+  sendJson(200,json);
 }
 
-static void initWeb() {
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/messages", HTTP_GET, handleMessages);
-  server.on("/api/messages", HTTP_GET, handleMessagesApi);
-  server.on("/messages/clear", HTTP_POST, [](){ clearHistory(); server.sendHeader("Location", "/messages"); server.send(303); });
-  server.on("/settings", HTTP_GET, handleSettings);
-  server.on("/nvs", HTTP_GET, handleNvs);
-  server.on("/factory-reset", HTTP_POST, handleFactoryReset);
-  server.on("/debug", HTTP_GET, handleDebug);
-  server.on("/api/debug", HTTP_GET, handleDebugApi);
-  server.on("/debug/clear", HTTP_POST, [](){ clearDebugLog(); server.sendHeader("Location", "/debug"); server.send(303); });
-  server.on("/save", HTTP_POST, handleSave);
-  server.on("/send", HTTP_POST, handleSend);
-  server.on("/status", HTTP_GET, handleStatus);
-  server.on("/reboot", HTTP_POST, [](){ server.send(200, "text/plain", "Rebooting"); delay(300); ESP.restart(); });
-  server.onNotFound([](){ server.sendHeader("Location", "/"); server.send(302); });
-  server.begin();
-  Serial.println("[WEB] HTTP server started");
+static void initWeb(){
+  const char *authHeaders[]={"Authorization","Content-Type"};server.collectHeaders(authHeaders,2);
+  server.on("/",HTTP_GET,[](){if(!requireWebAuth())return;handleRoot();});
+  server.on("/messages",HTTP_GET,[](){if(!requireWebAuth())return;handleMessages();});
+  server.on("/api/messages",HTTP_GET,[](){if(!requireWebAuth())return;handleMessagesApi();});
+  server.on("/api/history",HTTP_GET,[](){if(!requireWebAuth())return;String t=server.arg("type");if(t!="tx"&&t!="dapnet")t="rx";handleHistoryApi(t);});
+  server.on("/messages/clear",HTTP_POST,[](){if(!requireWebAuth()||!requireCsrf())return;clearAllHistory();redirectTo("/messages");});
+  server.on("/settings",HTTP_GET,[](){if(!requireWebAuth())return;handleSettings();});
+  server.on("/nvs",HTTP_GET,[](){if(!requireWebAuth())return;handleNvs();});
+  server.on("/factory-reset",HTTP_POST,[](){if(!requireWebAuth()||!requireCsrf())return;handleFactoryReset();});
+  server.on("/debug",HTTP_GET,[](){if(!requireWebAuth())return;handleDebug();});
+  server.on("/api/debug",HTTP_GET,[](){if(!requireWebAuth())return;handleDebugApi();});
+  server.on("/debug/clear",HTTP_POST,[](){if(!requireWebAuth()||!requireCsrf())return;clearDebugLog();redirectTo("/debug");});
+  server.on("/save",HTTP_POST,[](){if(!requireWebAuth()||!requireCsrf())return;handleSave();});
+  server.on("/send",HTTP_POST,[](){if(!requireWebAuth()||!requireCsrf())return;handleSend();});
+  server.on("/api/send",HTTP_POST,handleSendApi);
+  server.on("/status",HTTP_GET,[](){if(!requireWebAuth())return;handleStatus();});
+  server.on("/reboot",HTTP_POST,[](){if(!requireWebAuth()||!requireCsrf())return;sendText(200,"Rebooting");delay(300);ESP.restart();});
+  server.onNotFound([](){if(!requireWebAuth())return;prepareResponseHeaders(false);server.sendHeader("Location","/");server.send(302);});
+  server.begin();Serial.println("[WEB] authenticated HTTP server started");
 }
+
 
 void setup() {
   Serial.begin(115200);
   delay(800);
   Serial.println();
   Serial.printf("PocketDAPNET v%s by DM1PWN\n", POCKETDAPNET_VERSION);
+  if (healthMagic == HEALTH_MAGIC) {
+    healthLastStage[sizeof(healthLastStage) - 1] = '\0';
+    bootPreviousStage = healthLastStage;
+  } else {
+    bootPreviousStage = "cold boot";
+  }
+  healthMagic = HEALTH_MAGIC;
+  Serial.printf("[HEALTH] reset reason=%d previous stage=%s\n", (int)esp_reset_reason(), bootPreviousStage.c_str());
+  setHealthStage("setup");
+  initMemoryReservations();
   loadConfig();
+  initHistoryStorage();
+  ensureWebCredentials();
+  csrfToken=randomToken(32);
   cfg.dapnetTimeslots = normalizeDapnetTimeslots(cfg.dapnetTimeslots);
   if (!cfg.dapnetTimeslots.length()) cfg.dapnetTimeslots = DEFAULT_DAPNET_TIMESLOTS;
   initPower();
@@ -1311,34 +1855,91 @@ void setup() {
   dapnet.setLogHandler(dapnetWebLog);
   dapnet.configure(cfg.dapnetHost, cfg.dapnetPort, cfg.dapnetCallsign, cfg.dapnetAuthKey, cfg.dapnetEnabled);
   initWeb();
-  addDebugLog("SYSTEM", String("v") + POCKETDAPNET_VERSION + " boot complete");
+  initLoopWatchdog();
+  lastStationIdMillis = millis();
+  addDebugLog("SYSTEM", String("v") + POCKETDAPNET_VERSION + " boot complete; reset=" + String((int)esp_reset_reason()) + " previousStage=" + bootPreviousStage);
   drawDisplay();
   Serial.printf("[WEB] open http://%s/\n", (WiFi.status() == WL_CONNECTED ? WiFi.localIP() : WiFi.softAPIP()).toString().c_str());
 }
 
 void loop() {
+  const uint32_t loopStarted = millis();
+  feedLoopWatchdog();
+  setHealthStage("gps");
   processGps();
+  setHealthStage("ntp");
   processNtpSync();
+  setHealthStage("web");
   server.handleClient();
+  setHealthStage("dapnet.socket");
   dapnet.loop(WiFi.status() == WL_CONNECTED);
+  setHealthStage("dapnet.queue");
   processDapnetQueue();
+  setHealthStage("station.id");
+  processStationIdentification();
+  setHealthStage("button");
   handleButton();
   if (ledMessageUntil && (int32_t)(millis() - ledMessageUntil) >= 0) {
     ledMessageUntil = 0;
     restoreStatusLed();
   }
 
+  setHealthStage("pocsag.rx");
   if (receiverRunning && pager.available() > 0) {
+    // PagerClient direct RX is fed from the SX1278 DIO1 ISR while readData()
+    // consumes the same software buffer. After long runtimes this can race
+    // with PhysicalLayer::dropSync()/read() and leave readData() spinning
+    // until the task watchdog fires. Freeze the direct-RX producer before
+    // consuming the already buffered telegram, then fully re-arm RX below.
+    setHealthStage("pocsag.detected");
+    float capturedRssi = radio.getRSSI();
+
+    setHealthStage("pocsag.freeze-isr");
+    radio.clearDio1Action();
+    int16_t standbyState = radio.standby();
+    receiverRunning = false;
+    if (standbyState != RADIOLIB_ERR_NONE) {
+      Serial.printf("[POCSAG RX] standby before read failed: %d\n", standbyState);
+      addDebugLog("POCSAG", "standby before read failed: " + String(standbyState));
+    }
+
+    // RadioLib PagerClient::read() always consumes four bytes per POCSAG
+    // codeword. PhysicalLayer::read() does not guard bufferWritePos against
+    // underflow, while readData() loops on available() != 0. If Direct RX is
+    // stopped with a 1..3-byte tail, readData() can therefore underflow the
+    // counter and loop indefinitely. Only hand complete 32-bit codewords to
+    // PagerClient. A partial tail is discarded by re-arming the receiver.
+    const int16_t rawRxBytes = radio.available();
+    if (rawRxBytes < 4 || (rawRxBytes & 0x03) != 0) {
+      Serial.printf("[POCSAG RX] incomplete direct buffer: %d bytes; discard/re-arm\n", rawRxBytes);
+      addDebugLog("POCSAG", "incomplete direct buffer: " + String(rawRxBytes) + " bytes; discard/re-arm");
+      setHealthStage("pocsag.rearm");
+      delay(5);
+      int16_t restartState = startReceiver();
+      rxRestartCount++;
+      lastRxState = restartState;
+      Serial.printf("[POCSAG RX] re-arm #%lu -> %d\n", (unsigned long)rxRestartCount, restartState);
+      if (restartState != RADIOLIB_ERR_NONE) {
+        addDebugLog("POCSAG", "RX re-arm failed: " + String(restartState));
+      }
+      setHealthStage("idle");
+      esp_task_wdt_reset();
+      return;
+    }
+
     uint8_t message[256] = {0};
     size_t messageLen = sizeof(message) - 1;
     uint32_t address = 0;
+    setHealthStage("pocsag.read");
     int16_t state = pager.readData(message, &messageLen, &address);
     lastRxState = state;
+
+    setHealthStage("pocsag.process");
     if (state == RADIOLIB_ERR_NONE) {
       if (messageLen >= sizeof(message)) messageLen = sizeof(message) - 1;
       message[messageLen] = '\0';
       lastRxRic = address;
-      lastRxRssi = radio.getRSSI();
+      lastRxRssi = capturedRssi;
       lastRxMessage = reinterpret_cast<char *>(message);
       rxDecodeCount++;
       addRxHistory(lastRxRic, lastRxRssi, lastRxMessage);
@@ -1347,20 +1948,34 @@ void loop() {
       Serial.printf("[POCSAG RX] message: %s%s\n", lastRxMessage.c_str(), isConfiguredRic(lastRxRic) ? " [listed RIC]" : "");
       displayPage = 1;
       drawDisplay();
+    } else if (state == RADIOLIB_ERR_ADDRESS_NOT_FOUND) {
+      // Normal on a shared POCSAG channel: a valid batch was received but none
+      // of the configured RICs was present. This is not a decoder failure.
+      Serial.println("[POCSAG RX] batch ignored: no configured RIC found");
     } else {
       Serial.printf("[POCSAG RX] decode error: %d\n", state);
+      addDebugLog("POCSAG", "decode error: " + String(state));
     }
 
-    // Re-arm direct-mode receive after every completed read. This also
-    // clears stale direct-receive state that can otherwise leave the pager
-    // silent after the first decoded telegram on some SX1278/ESP32 builds.
+    // Re-arm direct-mode receive after every completed read. The previous
+    // DIO1 action was intentionally detached before readData(), so this call
+    // also installs a fresh ISR and clears stale direct-receive state.
+    setHealthStage("pocsag.rearm");
     delay(5);
     int16_t restartState = startReceiver();
     rxRestartCount++;
     lastRxState = restartState;
     Serial.printf("[POCSAG RX] re-arm #%lu -> %d\n", (unsigned long)rxRestartCount, restartState);
+    if (restartState != RADIOLIB_ERR_NONE) {
+      addDebugLog("POCSAG", "RX re-arm failed: " + String(restartState));
+    }
   }
 
   if (displayAvailable && millis() - lastDisplayUpdate > 3000) drawDisplay();
+  loopLastMs = millis() - loopStarted;
+  if (loopLastMs > loopMaxMs) loopMaxMs = loopLastMs;
+  loopCounter++;
+  setHealthStage("idle");
+  feedLoopWatchdog();
   delay(2);
 }

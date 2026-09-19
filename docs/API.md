@@ -1,6 +1,6 @@
 # PocketDAPNET Send API
 
-PocketDAPNET v0.7.0 provides an optional authenticated HTTP endpoint for event-driven POCSAG transmission from other systems.
+PocketDAPNET v0.7.x provides an optional authenticated HTTP endpoint for event-driven POCSAG transmission from other systems.
 
 ## Enable
 
@@ -52,3 +52,8 @@ The API is limited to 10 accepted requests in any 10-second window.
 ## Security
 
 The embedded HTTP server does not provide TLS. Do not expose PocketDAPNET directly to the public Internet. Use it on a trusted LAN/VPN, or place it behind a trusted TLS reverse proxy. TX Inhibit remains authoritative even when a valid API token is supplied.
+
+
+## Receiving messages from automation systems
+
+`/api/messages` and `/api/history?type=rx` remain available for authenticated polling. For event-driven delivery, PocketDAPNET v0.7.1 also provides an optional outbound RX webhook. See [WEBHOOK.md](WEBHOOK.md).

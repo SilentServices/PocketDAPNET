@@ -3,7 +3,7 @@
 **Open-source POCSAG transceiver and DAPNET node firmware.**  
 Current target: **LilyGO T-Beam AXP2101 V1.2 / SX1278 433 MHz**.
 
-Firmware version **v0.7.0 by DM1PWN**.
+Release candidate **v0.7.2-rc1 by DM1PWN**.
 
 > PocketDAPNET is an independent amateur-radio project. It is not an official DAPNET or LilyGO product.
 
@@ -23,6 +23,7 @@ Firmware version **v0.7.0 by DM1PWN**.
 - LED notification/status modes.
 - Runtime configuration stored in ESP32 NVS; bounded message histories stored in LittleFS.
 - TX Inhibit safety interlock, NVS configuration viewer and factory-reset function.
+- Optional outbound RX webhook integration for Home Assistant, Node-RED and other automation systems.
 
 ## Hardware
 
@@ -135,6 +136,43 @@ The hamburger menu provides:
 The dashboard and message list update automatically without a full page reload. The top bar shows the firmware version, current system time and active time source, and includes a reboot button.
 
 The **NVS / Config** page shows PocketDAPNET's stored configuration values. WiFi passwords, web passwords, API tokens and DAPNET authentication keys are deliberately masked. **Reset to factory defaults** clears the PocketDAPNET NVS namespace and the persistent message-history store, then reboots the device. The live DAPNET transmit queue and debug log remain RAM-only.
+
+## RX webhook integration
+
+PocketDAPNET can optionally send an HTTP JSON webhook whenever a POCSAG message is received for one of the **configured RIC subscriptions**. Promiscuous/debug-all-RIC traffic is deliberately not forwarded.
+
+Configure it under **Settings -> Integrations / RX webhook**:
+
+- enable/disable webhook delivery
+- webhook URL (stored as a secret and masked in the NVS viewer)
+
+For Home Assistant, create a webhook trigger and paste its local URL, for example:
+
+```text
+http://homeassistant.local:8123/api/webhook/YOUR_WEBHOOK_ID
+```
+
+Payload example:
+
+```json
+{
+  "event": "pocsag_rx",
+  "device": "PocketDAPNET",
+  "version": "0.7.1",
+  "buildId": "20260919-01",
+  "sequence": 42,
+  "timestamp": "2026-09-19 13:20:12",
+  "ric": 123456,
+  "rssi": -88.5,
+  "message": "TEST MESSAGE"
+}
+```
+
+Webhook delivery runs in a dedicated FreeRTOS worker with a bounded 8-event RAM queue so a slow automation endpoint does not block POCSAG RX, buttons or the embedded web server. Delivery is best-effort and not retried automatically; counters are available in `/status`.
+
+The current implementation accepts **`http://` URLs only**. This is intentional: PocketDAPNET does not silently disable TLS certificate verification. Keep the integration on a trusted LAN/VPN.
+
+See [docs/HOME_ASSISTANT.md](docs/HOME_ASSISTANT.md) for a complete Home Assistant setup and [docs/WEBHOOK.md](docs/WEBHOOK.md) for the generic webhook interface.
 
 ## Message history and debug log
 

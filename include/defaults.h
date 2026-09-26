@@ -27,6 +27,8 @@
 #define DEFAULT_WEB_PASSWORD         "pocketdapnet"
 #define DEFAULT_API_ENABLED          false
 #define DEFAULT_API_TOKEN            ""
+#define DEFAULT_WEBHOOK_ENABLED       false
+#define DEFAULT_WEBHOOK_URL           ""
 
 #define DEFAULT_STATION_ID_ENABLED   true
 #define DEFAULT_STATION_ID_INTERVAL_MIN 10

@@ -2,6 +2,37 @@
 
 All notable changes to PocketDAPNET are documented here.
 
+## [0.7.2-rc1] - 2026-09-26
+
+### Fixed
+
+- Fixed POCSAG alphanumeric receive truncation at the first batch boundary.
+- Multi-batch continuation now remains in SX1278 Direct-RX mode while RSSI is sampled.
+- Exact POCSAG page-end byte boundary is detected and trailing Direct-RX garbage is removed before `PagerClient::readData()`.
+- Frame-7 RICs can now receive long pages instead of only the first two characters.
+- Retains the ISR freeze / 32-bit alignment guards that prevent the earlier RadioLib `readData()` watchdog freeze.
+
+### Changed
+
+- Raw 32-bit POCSAG codeword diagnostics are disabled by default for normal operation.
+- Build ID updated to `20260926-05`.
+
+## [0.7.1] - 2026-09-19
+
+### Added
+- Optional outbound RX webhook integration for Home Assistant, Node-RED and similar automation systems.
+- Dedicated bounded FreeRTOS webhook worker so slow HTTP endpoints do not block the main RX/web loop.
+- Webhook delivery status counters in `/status`.
+
+### Changed
+- Webhook statistics counters use atomic operations for safe cross-task access and warning-free builds.
+- PlatformIO is pinned to pioarduino 55.03.38-1 and `min_spiffs.csv` to provide sufficient application space plus LittleFS history storage.
+
+### Security
+- Webhook URL is treated as a secret and masked in configuration/NVS views.
+- Debug-all-RIC traffic is never forwarded to the webhook.
+- Webhook implementation accepts `http://` only rather than disabling TLS certificate verification.
+
 ## [0.7.0] - 2026-09-18
 
 ### Added
@@ -79,3 +110,4 @@ All notable changes to PocketDAPNET are documented here.
 ### Notes
 - DAPNET queue and received-message history are RAM-only and are cleared on reboot.
 - Current primary supported target is the LilyGO T-Beam AXP2101 V1.2 / SX1278 433 MHz.
+

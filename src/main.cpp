@@ -5,10 +5,12 @@
  */
 
 #include <Arduino.h>
+#include <atomic>
 #include <SPI.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <FS.h>
 #include <LittleFS.h>
@@ -63,6 +65,8 @@ struct AppConfig {
   String webPassword = DEFAULT_WEB_PASSWORD;
   bool apiEnabled = DEFAULT_API_ENABLED;
   String apiToken = DEFAULT_API_TOKEN;
+  bool webhookEnabled = DEFAULT_WEBHOOK_ENABLED;
+  String webhookUrl = DEFAULT_WEBHOOK_URL;
 
   bool stationIdEnabled = DEFAULT_STATION_ID_ENABLED;
   uint16_t stationIdIntervalMin = DEFAULT_STATION_ID_INTERVAL_MIN;
@@ -152,6 +156,23 @@ uint32_t dapnetLastRic = 0;
 uint32_t lastStationIdMillis = 0;
 bool stationIdQueued = false;
 String generatedWebPassword;
+
+struct WebhookEvent {
+  uint32_t sequence = 0;
+  uint32_t ric = 0;
+  int16_t rssi10 = 0;
+  int64_t timestamp = 0;
+  uint32_t uptimeSeconds = 0;
+  char message[241] = {0};
+};
+
+static constexpr size_t WEBHOOK_QUEUE_SIZE = 8;
+QueueHandle_t webhookQueue = nullptr;
+TaskHandle_t webhookTaskHandle = nullptr;
+std::atomic<uint32_t> webhookDeliveredCount{0};
+std::atomic<uint32_t> webhookFailedCount{0};
+std::atomic<uint32_t> webhookDroppedCount{0};
+std::atomic<int> webhookLastHttpCode{0};
 
 static constexpr size_t DEBUG_LOG_SIZE = 96;
 String debugLogLines[DEBUG_LOG_SIZE];
@@ -403,6 +424,93 @@ static bool parseRxRics() {
   return rxAddressCount > 0;
 }
 
+static String formatLocalTime(time_t t);
+
+static bool validWebhookUrl(String v, bool allowEmpty = true) {
+  v.trim();
+  if (!v.length()) return allowEmpty;
+  if (v.length() > 255 || !v.startsWith("http://")) return false;
+  for (size_t i = 0; i < v.length(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(v[i]);
+    if (c <= 0x20 || c > 0x7E) return false;
+  }
+  return true;
+}
+
+static String webhookTimestamp(const WebhookEvent &e) {
+  if (e.timestamp > 0) return formatLocalTime((time_t)e.timestamp);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "uptime %02lu:%02lu:%02lu",
+           (unsigned long)(e.uptimeSeconds / 3600UL),
+           (unsigned long)((e.uptimeSeconds % 3600UL) / 60UL),
+           (unsigned long)(e.uptimeSeconds % 60UL));
+  return String(buf);
+}
+
+static void webhookTask(void *parameter) {
+  (void)parameter;
+  WebhookEvent event;
+  for (;;) {
+    if (!webhookQueue || xQueueReceive(webhookQueue, &event, portMAX_DELAY) != pdTRUE) continue;
+    if (!cfg.webhookEnabled || !cfg.webhookUrl.length()) continue;
+    if (WiFi.status() != WL_CONNECTED) {
+      webhookFailedCount.fetch_add(1, std::memory_order_relaxed);
+      webhookLastHttpCode.store(-1, std::memory_order_relaxed);
+      continue;
+    }
+
+    String payload;
+    payload.reserve(520);
+    payload = "{\"event\":\"pocsag_rx\",\"device\":\"" + String(POCKETDAPNET_PROJECT_NAME) +
+              "\",\"version\":\"" + String(POCKETDAPNET_VERSION) +
+              "\",\"buildId\":\"" + String(POCKETDAPNET_BUILD_ID) +
+              "\",\"sequence\":" + String(event.sequence) +
+              ",\"timestamp\":\"" + jsonEscape(webhookTimestamp(event)) +
+              "\",\"ric\":" + String(event.ric) +
+              ",\"rssi\":" + String((float)event.rssi10 / 10.0f, 1) +
+              ",\"message\":\"" + jsonEscape(displaySafeText(String(event.message))) + "\"}";
+
+    HTTPClient http;
+    http.setConnectTimeout(1500);
+    http.setTimeout(2000);
+    int code = -1;
+    if (http.begin(cfg.webhookUrl)) {
+      http.addHeader("Content-Type", "application/json");
+      http.addHeader("User-Agent", POCKETDAPNET_USER_AGENT);
+      code = http.POST(payload);
+      http.end();
+    }
+    webhookLastHttpCode.store(code, std::memory_order_relaxed);
+    if (code >= 200 && code < 300) webhookDeliveredCount.fetch_add(1, std::memory_order_relaxed);
+    else webhookFailedCount.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+static void initWebhook() {
+  webhookQueue = xQueueCreate(WEBHOOK_QUEUE_SIZE, sizeof(WebhookEvent));
+  if (!webhookQueue) {
+    Serial.println("[WEBHOOK] failed to create event queue");
+    return;
+  }
+  BaseType_t ok = xTaskCreatePinnedToCore(webhookTask, "pocketWebhook", 6144, nullptr, 1, &webhookTaskHandle, 0);
+  Serial.printf("[WEBHOOK] worker %s; enabled=%s\n", ok == pdPASS ? "started" : "FAILED", cfg.webhookEnabled ? "yes" : "no");
+}
+
+static void enqueueRxWebhook(const HistoryEntry &e) {
+  if (!cfg.webhookEnabled || !cfg.webhookUrl.length() || !(e.flags & HISTORY_FLAG_CONFIGURED) || !webhookQueue) return;
+  WebhookEvent event{};
+  event.sequence = e.sequence;
+  event.ric = e.ric;
+  event.rssi10 = e.rssi10;
+  event.timestamp = e.timestamp;
+  event.uptimeSeconds = e.uptimeSeconds;
+  strncpy(event.message, e.message, sizeof(event.message) - 1);
+  if (xQueueSend(webhookQueue, &event, 0) != pdTRUE) {
+    webhookDroppedCount.fetch_add(1, std::memory_order_relaxed);
+    addDebugLog("WEBHOOK", "queue full; dropped RX event RIC=" + String(e.ric));
+  }
+}
+
 static String formatUptime(uint32_t seconds) {
   uint32_t h = seconds / 3600;
   uint32_t m = (seconds % 3600) / 60;
@@ -568,6 +676,7 @@ static void addRxHistory(uint32_t ric, float rssi, const String &message) {
   rxHistoryHead = (rxHistoryHead + 1) % HISTORY_SIZE;
   if (rxHistoryCount < HISTORY_SIZE) rxHistoryCount++;
   persistHistorySlot(0, slot);
+  enqueueRxWebhook(e);
 }
 
 static void addTxHistory(uint32_t ric, const String &message, uint16_t baud, const char *source, bool success, const String &status) {
@@ -629,6 +738,8 @@ static void loadConfig() {
   cfg.webPassword = prefs.getString("webpass", DEFAULT_WEB_PASSWORD);
   cfg.apiEnabled = prefs.getBool("apien", DEFAULT_API_ENABLED);
   cfg.apiToken = prefs.getString("apitoken", DEFAULT_API_TOKEN);
+  cfg.webhookEnabled = prefs.getBool("whenable", DEFAULT_WEBHOOK_ENABLED);
+  cfg.webhookUrl = prefs.getString("whurl", DEFAULT_WEBHOOK_URL);
   cfg.stationIdEnabled = prefs.getBool("idenable", DEFAULT_STATION_ID_ENABLED);
   cfg.stationIdIntervalMin = prefs.getUShort("idint", DEFAULT_STATION_ID_INTERVAL_MIN);
   if (cfg.stationIdIntervalMin < 1 || cfg.stationIdIntervalMin > 60) cfg.stationIdIntervalMin = DEFAULT_STATION_ID_INTERVAL_MIN;
@@ -670,6 +781,8 @@ static void saveConfig() {
   prefs.putString("webpass", cfg.webPassword);
   prefs.putBool("apien", cfg.apiEnabled);
   prefs.putString("apitoken", cfg.apiToken);
+  prefs.putBool("whenable", cfg.webhookEnabled);
+  prefs.putString("whurl", cfg.webhookUrl);
   prefs.putBool("idenable", cfg.stationIdEnabled);
   prefs.putUShort("idint", cfg.stationIdIntervalMin);
   prefs.putFloat("freq", cfg.frequencyMHz);
@@ -998,11 +1111,25 @@ static int16_t configurePager(float frequency, uint16_t baud = 0) {
   return state;
 }
 
+static void resetDirectRxBuffer() {
+  // RadioLib direct RX state is ISR-driven. Reset it explicitly before every
+  // new POCSAG receive cycle so stale sync/buffer state cannot leak across
+  // TX, discarded frames or decoder restarts. RADIOLIB_GODMODE exposes these
+  // members for this narrowly-scoped workaround.
+  radio.clearDio1Action();
+  radio.gotSync = false;
+  radio.syncBuffer = 0;
+  radio.bufferWritePos = 0;
+  radio.bufferReadPos = 0;
+  radio.bufferBitPos = 0;
+}
+
 static int16_t startReceiver() {
   if (!parseRxRics()) {
     receiverRunning = false;
     return RADIOLIB_ERR_INVALID_ADDRESS_WIDTH;
   }
+  resetDirectRxBuffer();
   int16_t state = configurePager(rxFrequency());
   if (state != RADIOLIB_ERR_NONE) return state;
   if (cfg.debugAllRics) {
@@ -1367,6 +1494,9 @@ static String validateSettingsInput(){
   v=server.arg("webuser");v.trim();if(!printableAscii(v,32))return "Web username must be 1-32 printable ASCII characters";
   v=server.arg("webpass");if(v.length()&&(!printableAscii(v,64)||v.length()<8))return "Web password must be 8-64 printable ASCII characters";
   v=server.arg("apitoken");if(v.length()&&(!printableAscii(v,128)||v.length()<16))return "API token must be 16-128 printable ASCII characters";
+  v=server.arg("whurl");if(v.length()&&!validWebhookUrl(v,false))return "Webhook URL must be a valid http:// URL without spaces (max 255 characters)";
+  if(server.hasArg("whenable")&&!server.hasArg("whclear")&&!v.length()&&!cfg.webhookUrl.length())return "Webhook URL is required when RX webhook delivery is enabled";
+  if(server.hasArg("whenable")&&server.hasArg("whclear"))return "Webhook cannot be enabled while clearing the webhook URL";
   float f=server.arg("freq").toFloat();if(f<400.0f||f>510.0f)return "Base frequency must be within 400-510 MHz";
   float rc=server.arg("rxcorr").toFloat(),tc=server.arg("txcorr").toFloat();if(rc<-.1f||rc>.1f||tc<-.1f||tc>.1f)return "Frequency correction must be within +/-0.1 MHz";
   int b=server.arg("baud").toInt();if(!(b==512||b==1200||b==2400))return "Baud must be 512, 1200 or 2400";
@@ -1570,6 +1700,13 @@ static String buildSettings(const String &notice = "") {
        "<small>Minimum 16 characters. POST /api/send uses Authorization: Bearer &lt;token&gt;.</small>";
   h += F("</fieldset>");
 
+  h += F("<fieldset><legend>Integrations / RX webhook</legend>");
+  h += "<label><input style='width:auto' type='checkbox' name='whenable' value='1'" + checked(cfg.webhookEnabled) + "> Enable RX webhook notifications</label>";
+  h += "<label>Webhook URL</label><input type='password' name='whurl' value='' placeholder='leave blank to keep current'>";
+  h += "<label><input style='width:auto' type='checkbox' name='whclear' value='1'> Clear stored webhook URL</label>";
+  h += "<small>POSTs JSON for received messages matching the configured RIC list. Debug-all-RIC traffic is never forwarded. Current URL: " + (cfg.webhookUrl.length() ? String("configured") : String("not configured")) + ". v0.7.1 supports http:// webhooks on trusted networks; HTTPS is intentionally not accepted without certificate validation.</small>";
+  h += F("</fieldset>");
+
   h += F("<fieldset><legend>Station identification</legend>");
   h += "<label><input style='width:auto' type='checkbox' name='idenable' value='1'" + checked(cfg.stationIdEnabled) + "> Enable local callsign identification fallback</label>";
   h += "<label>Interval (minutes)</label><input name='idint' type='number' min='1' max='60' value='" + String(cfg.stationIdIntervalMin) + "'><small>Uses DAPNET callsign and RIC 8. A received/sent DAPNET RIC-8 identification with the same callsign resets the timer, avoiding duplicate beacons.</small>";
@@ -1617,6 +1754,7 @@ static String buildNvsPage() {
   row("txinhib", cfg.txInhibit ? "true" : "false"); row("defaultWebPassword", webUsesDefaultPassword() ? "true" : "false");
   row("webuser", cfg.webUsername); row("webpass", maskedSecret(cfg.webPassword));
   row("apien", cfg.apiEnabled ? "true" : "false"); row("apitoken", maskedSecret(cfg.apiToken));
+  row("whenable", cfg.webhookEnabled ? "true" : "false"); row("whurl", maskedSecret(cfg.webhookUrl));
   row("idenable", cfg.stationIdEnabled ? "true" : "false"); row("idint", String(cfg.stationIdIntervalMin));
   row("freq", String(cfg.frequencyMHz, 6)); row("rxcorr", String(cfg.rxCorrectionMHz, 6)); row("txcorr", String(cfg.txCorrectionMHz, 6));
   row("baud", String(cfg.baud)); row("shift", String(cfg.shiftHz)); row("txpwr", String(cfg.txPowerDbm)); row("invert", cfg.invert ? "true" : "false");
@@ -1660,6 +1798,10 @@ static void handleSave() {
   cfg.apiEnabled = server.hasArg("apien");
   if (server.arg("apitoken").length()) cfg.apiToken = server.arg("apitoken");
   if (cfg.apiEnabled && cfg.apiToken.length() < 16) cfg.apiEnabled = false;
+  cfg.webhookEnabled = server.hasArg("whenable");
+  if (server.hasArg("whclear")) cfg.webhookUrl = "";
+  else if (server.arg("whurl").length()) { cfg.webhookUrl = server.arg("whurl"); cfg.webhookUrl.trim(); }
+  if (cfg.webhookEnabled && !cfg.webhookUrl.length()) cfg.webhookEnabled = false;
   cfg.stationIdEnabled = server.hasArg("idenable");
   cfg.stationIdIntervalMin = (uint16_t)server.arg("idint").toInt();
   if (cfg.stationIdIntervalMin < 1 || cfg.stationIdIntervalMin > 60) cfg.stationIdIntervalMin = DEFAULT_STATION_ID_INTERVAL_MIN;
@@ -1740,6 +1882,13 @@ static void handleStatus() {
   json += "\"txBlocked\":" + String(txBlocked() ? "true" : "false") + ",";
   json += "\"defaultWebPassword\":" + String(webUsesDefaultPassword() ? "true" : "false") + ",";
   json += "\"apiEnabled\":" + String(cfg.apiEnabled ? "true" : "false") + ",";
+  json += "\"webhookEnabled\":" + String(cfg.webhookEnabled ? "true" : "false") + ",";
+  json += "\"webhookConfigured\":" + String(cfg.webhookUrl.length() ? "true" : "false") + ",";
+  json += "\"webhookQueue\":" + String(webhookQueue ? (unsigned)uxQueueMessagesWaiting(webhookQueue) : 0U) + ",";
+  json += "\"webhookDelivered\":" + String((unsigned long)webhookDeliveredCount.load(std::memory_order_relaxed)) + ",";
+  json += "\"webhookFailed\":" + String((unsigned long)webhookFailedCount.load(std::memory_order_relaxed)) + ",";
+  json += "\"webhookDropped\":" + String((unsigned long)webhookDroppedCount.load(std::memory_order_relaxed)) + ",";
+  json += "\"webhookLastHttpCode\":" + String(webhookLastHttpCode.load(std::memory_order_relaxed)) + ",";
   json += "\"stationIdEnabled\":" + String(cfg.stationIdEnabled ? "true" : "false") + ",";
   json += "\"rxRicCount\":" + String((unsigned)rxAddressCount) + ",";
   json += "\"debugAllRics\":" + String(cfg.debugAllRics ? "true" : "false") + ",";
@@ -1851,6 +2000,7 @@ void setup() {
   initRadio();
   initWifi();
   startNtp();
+  initWebhook();
   dapnet.setMessageHandler(enqueueDapnetMessage);
   dapnet.setLogHandler(dapnetWebLog);
   dapnet.configure(cfg.dapnetHost, cfg.dapnetPort, cfg.dapnetCallsign, cfg.dapnetAuthKey, cfg.dapnetEnabled);
@@ -1885,90 +2035,323 @@ void loop() {
   }
 
   setHealthStage("pocsag.rx");
-  if (receiverRunning && pager.available() > 0) {
-    // PagerClient direct RX is fed from the SX1278 DIO1 ISR while readData()
-    // consumes the same software buffer. After long runtimes this can race
-    // with PhysicalLayer::dropSync()/read() and leave readData() spinning
-    // until the task watchdog fires. Freeze the direct-RX producer before
-    // consuming the already buffered telegram, then fully re-arm RX below.
-    setHealthStage("pocsag.detected");
-    float capturedRssi = radio.getRSSI();
 
-    setHealthStage("pocsag.freeze-isr");
-    radio.clearDio1Action();
-    int16_t standbyState = radio.standby();
-    receiverRunning = false;
-    if (standbyState != RADIOLIB_ERR_NONE) {
-      Serial.printf("[POCSAG RX] standby before read failed: %d\n", standbyState);
-      addDebugLog("POCSAG", "standby before read failed: " + String(standbyState));
+  // RadioLib's PagerClient::available() becomes true as soon as ONE complete
+  // POCSAG batch is buffered. That is not necessarily the end of the page:
+  // for a RIC in frame 7, for example, only one message codeword (about two
+  // alpha characters) remains in the first batch. Long pages continue after
+  // the next frame-sync word.
+  //
+  // Do not use radio.available() growth as an end-of-page detector here. The
+  // underlying RadioLib write counter is modified by the DIO1 ISR and is not
+  // declared volatile upstream. Instead, with RADIOLIB_GODMODE enabled, take
+  // an explicit volatile snapshot of the direct buffer and inspect complete
+  // POCSAG codewords. We keep collecting until the matched address is followed
+  // by an IDLE codeword or a new address codeword, across any intervening sync
+  // words. This makes the batch boundary explicit and deterministic.
+  static bool pocsagRxPending = false;
+  static uint32_t pocsagPendingSinceMs = 0;
+  static float pocsagPendingRssi = 0.0f;
+  static uint8_t pocsagLastObservedBytes = 0;
+  static uint8_t pocsagLastLoggedBytes = 0;
+  static constexpr uint32_t POCSAG_RX_MAX_COLLECT_MS = 3000;
+  static constexpr uint8_t POCSAG_RX_BUFFER_GUARD = 232;
+
+  auto directRxBytesSnapshot = []() -> uint8_t {
+    return *reinterpret_cast<volatile uint8_t *>(&radio.bufferWritePos);
+  };
+
+  auto directRxCodeword = [&](size_t wordIndex) -> uint32_t {
+    volatile uint8_t *buf = reinterpret_cast<volatile uint8_t *>(radio.buffer);
+    const size_t off = wordIndex * 4;
+    uint32_t cw = ((uint32_t)buf[off] << 24) |
+                  ((uint32_t)buf[off + 1] << 16) |
+                  ((uint32_t)buf[off + 2] << 8) |
+                  ((uint32_t)buf[off + 3]);
+    // Mirror PagerClient::read(): SX127x direct data polarity is opposite to
+    // POCSAG unless the user explicitly enabled inversion.
+    if (!cfg.invert) cw = ~cw;
+    return cw;
+  };
+
+  auto directRxPageComplete = [&](uint8_t byteCount, uint32_t &matchedRic,
+                                  uint8_t &pageEndBytes) -> bool {
+    const size_t words = byteCount / 4;
+    uint8_t framePos = 0;
+    bool matched = false;
+
+    for (size_t i = 0; i < words; ++i) {
+      const uint32_t cw = directRxCodeword(i);
+
+      // Once a complete 16-codeword batch has been consumed, a continued
+      // POCSAG page MUST be followed by a frame-sync codeword. If bytes are
+      // already present and the next complete codeword is not SYNC, the page
+      // ended at the previous batch boundary. This is important for frame-7
+      // RICs, where a long page can fill the whole following batch and the
+      // direct-mode receiver may subsequently capture unrelated trailing bits.
+      if (matched && framePos == 16 && cw != RADIOLIB_PAGER_FRAME_SYNC_CODE_WORD) {
+        pageEndBytes = (uint8_t)(i * 4);  // exclude the non-sync trailing word
+        return true;
+      }
+
+      framePos++;
+
+      if (cw == RADIOLIB_PAGER_IDLE_CODE_WORD) {
+        if (matched) {
+          pageEndBytes = (uint8_t)((i + 1) * 4);  // include IDLE terminator
+          return true;
+        }
+        continue;
+      }
+      if (cw == RADIOLIB_PAGER_FRAME_SYNC_CODE_WORD) {
+        framePos = 0;
+        continue;
+      }
+
+      const bool messageWord =
+          (cw & (RADIOLIB_PAGER_MESSAGE_CODE_WORD << (RADIOLIB_PAGER_CODE_WORD_LEN - 1))) != 0;
+
+      if (!matched) {
+        if (messageWord) continue;
+        const uint32_t addrFound =
+            ((cw & RADIOLIB_PAGER_ADDRESS_BITS_MASK) >> (RADIOLIB_PAGER_ADDRESS_POS - 3)) |
+            (framePos / 2);
+        if (cfg.debugAllRics || isConfiguredRic(addrFound)) {
+          matched = true;
+          matchedRic = addrFound;
+        }
+      } else if (!messageWord) {
+        // A new address after our message terminates the current page. Do not
+        // pass that next address to PagerClient::readData().
+        pageEndBytes = (uint8_t)(i * 4);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto dumpDirectRxCodewords = [&](uint8_t byteCount, const char *reason) {
+    if (!POCKETDAPNET_POCSAG_RAW_DEBUG) return;
+    const size_t words = byteCount / 4;
+    uint8_t framePos = 0;
+    bool matched = false;
+    Serial.printf("[POCSAG RAW] reason=%s bytes=%u words=%u bitPos=%u gotSync=%u\n",
+                  reason, (unsigned)byteCount, (unsigned)words,
+                  (unsigned)radio.bufferBitPos, radio.gotSync ? 1U : 0U);
+
+    const size_t maxWords = words > 64 ? 64 : words;
+    for (size_t i = 0; i < maxWords; ++i) {
+      const uint32_t cw = directRxCodeword(i);
+      framePos++;
+      const char *kind = "UNKNOWN";
+      uint32_t addrFound = 0;
+      bool configured = false;
+
+      if (cw == RADIOLIB_PAGER_FRAME_SYNC_CODE_WORD) {
+        kind = "SYNC";
+        framePos = 0;
+      } else if (cw == RADIOLIB_PAGER_IDLE_CODE_WORD) {
+        kind = "IDLE";
+      } else if ((cw & (RADIOLIB_PAGER_MESSAGE_CODE_WORD <<
+                       (RADIOLIB_PAGER_CODE_WORD_LEN - 1))) != 0) {
+        kind = "MESSAGE";
+      } else {
+        kind = "ADDRESS";
+        addrFound =
+            ((cw & RADIOLIB_PAGER_ADDRESS_BITS_MASK) >>
+             (RADIOLIB_PAGER_ADDRESS_POS - 3)) |
+            (framePos / 2);
+        configured = cfg.debugAllRics || isConfiguredRic(addrFound);
+        if (configured) matched = true;
+      }
+
+      if (kind[0] == 'A') {
+        Serial.printf("[POCSAG RAW] CW%02u 0x%08lX %-7s framePos=%u ric=%lu%s%s\n",
+                      (unsigned)i, (unsigned long)cw, kind, (unsigned)framePos,
+                      (unsigned long)addrFound, configured ? " MATCH" : "",
+                      matched ? " active" : "");
+      } else {
+        Serial.printf("[POCSAG RAW] CW%02u 0x%08lX %-7s framePos=%u%s\n",
+                      (unsigned)i, (unsigned long)cw, kind, (unsigned)framePos,
+                      matched ? " active" : "");
+      }
+    }
+    if (words > maxWords) {
+      Serial.printf("[POCSAG RAW] ... %u more codewords omitted\n",
+                    (unsigned)(words - maxWords));
+    }
+  };
+
+  if (receiverRunning && pager.available() > 0) {
+    const uint32_t nowMs = millis();
+    const uint8_t rawSnapshot = directRxBytesSnapshot();
+
+    if (!pocsagRxPending) {
+      pocsagRxPending = true;
+      pocsagPendingSinceMs = nowMs;
+      pocsagPendingRssi = radio.getRSSI(false, true);
+      pocsagLastObservedBytes = rawSnapshot;
+      pocsagLastLoggedBytes = rawSnapshot;
+      Serial.printf("[POCSAG RX] first batch ready, collecting continuation (bytes=%u bitPos=%u)\n",
+                    (unsigned)rawSnapshot, (unsigned)radio.bufferBitPos);
+      dumpDirectRxCodewords(rawSnapshot, "FIRST_BATCH");
+      setHealthStage("pocsag.collect");
+    } else {
+      const float rssiNow = radio.getRSSI(false, true);
+      if (rssiNow > pocsagPendingRssi) pocsagPendingRssi = rssiNow;
+      if (rawSnapshot != pocsagLastObservedBytes) {
+        pocsagLastObservedBytes = rawSnapshot;
+        // Log growth in coarse steps to avoid flooding the serial port.
+        if ((uint8_t)(rawSnapshot - pocsagLastLoggedBytes) >= 16 || rawSnapshot < pocsagLastLoggedBytes) {
+          if (POCKETDAPNET_POCSAG_RAW_DEBUG) {
+            Serial.printf("[POCSAG RX] direct buffer growth: bytes=%u bitPos=%u age=%lums\n",
+                          (unsigned)rawSnapshot, (unsigned)radio.bufferBitPos,
+                          (unsigned long)(nowMs - pocsagPendingSinceMs));
+          }
+          pocsagLastLoggedBytes = rawSnapshot;
+        }
+      }
     }
 
-    // RadioLib PagerClient::read() always consumes four bytes per POCSAG
-    // codeword. PhysicalLayer::read() does not guard bufferWritePos against
-    // underflow, while readData() loops on available() != 0. If Direct RX is
-    // stopped with a 1..3-byte tail, readData() can therefore underflow the
-    // counter and loop indefinitely. Only hand complete 32-bit codewords to
-    // PagerClient. A partial tail is discarded by re-arming the receiver.
-    const int16_t rawRxBytes = radio.available();
-    if (rawRxBytes < 4 || (rawRxBytes & 0x03) != 0) {
-      Serial.printf("[POCSAG RX] incomplete direct buffer: %d bytes; discard/re-arm\n", rawRxBytes);
-      addDebugLog("POCSAG", "incomplete direct buffer: " + String(rawRxBytes) + " bytes; discard/re-arm");
+    uint32_t detectedRic = 0;
+    uint8_t pageEndBytes = 0;
+    const bool pageComplete = directRxPageComplete(rawSnapshot, detectedRic, pageEndBytes);
+    const bool bufferGuard = rawSnapshot >= POCSAG_RX_BUFFER_GUARD;
+    const bool collectTimeout = (uint32_t)(nowMs - pocsagPendingSinceMs) >= POCSAG_RX_MAX_COLLECT_MS;
+
+    if (pageComplete || bufferGuard || collectTimeout) {
+      const char *decisionReason = pageComplete ? "PAGE_COMPLETE" : (bufferGuard ? "BUFFER_GUARD" : "COLLECT_TIMEOUT");
+      Serial.printf("[POCSAG RX] collection decision=%s bytes=%u pageEnd=%u detectedRic=%lu age=%lums\n",
+                    decisionReason, (unsigned)rawSnapshot, (unsigned)pageEndBytes,
+                    (unsigned long)detectedRic,
+                    (unsigned long)(nowMs - pocsagPendingSinceMs));
+      dumpDirectRxCodewords(rawSnapshot, decisionReason);
+      addDebugLog("POCSAG", String("RX collect ") + decisionReason +
+                  " bytes=" + String(rawSnapshot) +
+                  " ric=" + String(detectedRic));
+      setHealthStage("pocsag.detected");
+      const float capturedRssi = pocsagPendingRssi;
+
+      if (bufferGuard) {
+        addDebugLog("POCSAG", "direct RX buffer guard reached at " + String(rawSnapshot) + " bytes");
+      }
+      if (collectTimeout) {
+        addDebugLog("POCSAG", "direct RX collect timeout at " + String(rawSnapshot) + " bytes");
+      }
+
+      setHealthStage("pocsag.freeze-isr");
+      radio.clearDio1Action();
+      int16_t standbyState = radio.standby();
+      receiverRunning = false;
+      if (standbyState != RADIOLIB_ERR_NONE) {
+        Serial.printf("[POCSAG RX] standby before read failed: %d\n", standbyState);
+        addDebugLog("POCSAG", "standby before read failed: " + String(standbyState));
+      }
+
+      // A few bits/bytes can arrive between the snapshot and interrupt detach.
+      // Keep only complete 32-bit codewords. Since pageComplete was observed on
+      // an already-complete codeword, trimming a partial tail is safe.
+      uint8_t rawRxBytes = directRxBytesSnapshot();
+      uint8_t alignedRxBytes = rawRxBytes & 0xFC;
+
+      // If the scanner found the exact end of the current page, cap the
+      // RadioLib direct buffer to that boundary. Bytes arriving between the
+      // decision and clearDio1Action()/standby() must never become part of the
+      // decoded text.
+      if (pageComplete && pageEndBytes >= 4 && pageEndBytes < alignedRxBytes) {
+        Serial.printf("[POCSAG RX] trim after page end: %u -> %u bytes\n",
+                      (unsigned)alignedRxBytes, (unsigned)pageEndBytes);
+        alignedRxBytes = pageEndBytes;
+      }
+
+      if (alignedRxBytes != rawRxBytes) {
+        Serial.printf("[POCSAG RX] trim direct buffer: %u -> %u bytes\n",
+                      (unsigned)rawRxBytes, (unsigned)alignedRxBytes);
+      }
+      radio.bufferWritePos = alignedRxBytes;
+      radio.bufferBitPos = 0;
+      rawRxBytes = alignedRxBytes;
+
+      if (rawRxBytes < 4) {
+        Serial.printf("[POCSAG RX] settled buffer too short: %u bytes; discard/re-arm\n",
+                      (unsigned)rawRxBytes);
+        addDebugLog("POCSAG", "settled buffer too short; discard/re-arm");
+        setHealthStage("pocsag.rearm");
+        delay(5);
+        int16_t restartState = startReceiver();
+        rxRestartCount++;
+        lastRxState = restartState;
+        pocsagRxPending = false;
+        pocsagPendingSinceMs = 0;
+        pocsagPendingRssi = 0.0f;
+        pocsagLastObservedBytes = 0;
+        pocsagLastLoggedBytes = 0;
+        setHealthStage("idle");
+        esp_task_wdt_reset();
+        return;
+      }
+
+      uint8_t message[256] = {0};
+      size_t messageLen = sizeof(message) - 1;
+      uint32_t address = 0;
+      setHealthStage("pocsag.read");
+      int16_t state = pager.readData(message, &messageLen, &address);
+      lastRxState = state;
+
+      setHealthStage("pocsag.process");
+      if (state == RADIOLIB_ERR_NONE) {
+        if (messageLen >= sizeof(message)) messageLen = sizeof(message) - 1;
+        message[messageLen] = '\0';
+        lastRxRic = address;
+        lastRxRssi = capturedRssi;
+        lastRxMessage = reinterpret_cast<char *>(message);
+        rxDecodeCount++;
+        addRxHistory(lastRxRic, lastRxRssi, lastRxMessage);
+        if (isConfiguredRic(lastRxRic)) signalConfiguredMessage();
+        Serial.printf("[POCSAG RX] #%lu RIC=%lu len=%u RSSI=%.1f dBm bytes=%u complete=%s\n",
+                      (unsigned long)rxDecodeCount,
+                      (unsigned long)address,
+                      (unsigned)messageLen,
+                      lastRxRssi,
+                      (unsigned)rawRxBytes,
+                      pageComplete ? "yes" : "guard/timeout");
+        Serial.printf("[POCSAG RX] message: %s%s\n", lastRxMessage.c_str(),
+                      isConfiguredRic(lastRxRic) ? " [listed RIC]" : "");
+        displayPage = 1;
+        drawDisplay();
+      } else if (state == RADIOLIB_ERR_ADDRESS_NOT_FOUND) {
+        Serial.println("[POCSAG RX] batch ignored: no configured RIC found");
+      } else {
+        Serial.printf("[POCSAG RX] decode error: %d\n", state);
+        addDebugLog("POCSAG", "decode error: " + String(state));
+      }
+
       setHealthStage("pocsag.rearm");
       delay(5);
       int16_t restartState = startReceiver();
       rxRestartCount++;
       lastRxState = restartState;
-      Serial.printf("[POCSAG RX] re-arm #%lu -> %d\n", (unsigned long)rxRestartCount, restartState);
+      Serial.printf("[POCSAG RX] re-arm #%lu -> %d\n",
+                    (unsigned long)rxRestartCount, restartState);
       if (restartState != RADIOLIB_ERR_NONE) {
         addDebugLog("POCSAG", "RX re-arm failed: " + String(restartState));
       }
-      setHealthStage("idle");
-      esp_task_wdt_reset();
-      return;
-    }
 
-    uint8_t message[256] = {0};
-    size_t messageLen = sizeof(message) - 1;
-    uint32_t address = 0;
-    setHealthStage("pocsag.read");
-    int16_t state = pager.readData(message, &messageLen, &address);
-    lastRxState = state;
-
-    setHealthStage("pocsag.process");
-    if (state == RADIOLIB_ERR_NONE) {
-      if (messageLen >= sizeof(message)) messageLen = sizeof(message) - 1;
-      message[messageLen] = '\0';
-      lastRxRic = address;
-      lastRxRssi = capturedRssi;
-      lastRxMessage = reinterpret_cast<char *>(message);
-      rxDecodeCount++;
-      addRxHistory(lastRxRic, lastRxRssi, lastRxMessage);
-      if (isConfiguredRic(lastRxRic)) signalConfiguredMessage();
-      Serial.printf("[POCSAG RX] #%lu RIC=%lu len=%u RSSI=%.1f dBm\n", (unsigned long)rxDecodeCount, (unsigned long)address, (unsigned)messageLen, lastRxRssi);
-      Serial.printf("[POCSAG RX] message: %s%s\n", lastRxMessage.c_str(), isConfiguredRic(lastRxRic) ? " [listed RIC]" : "");
-      displayPage = 1;
-      drawDisplay();
-    } else if (state == RADIOLIB_ERR_ADDRESS_NOT_FOUND) {
-      // Normal on a shared POCSAG channel: a valid batch was received but none
-      // of the configured RICs was present. This is not a decoder failure.
-      Serial.println("[POCSAG RX] batch ignored: no configured RIC found");
+      pocsagRxPending = false;
+      pocsagPendingSinceMs = 0;
+      pocsagPendingRssi = 0.0f;
+      pocsagLastObservedBytes = 0;
+      pocsagLastLoggedBytes = 0;
     } else {
-      Serial.printf("[POCSAG RX] decode error: %d\n", state);
-      addDebugLog("POCSAG", "decode error: " + String(state));
+      setHealthStage("pocsag.collect");
     }
-
-    // Re-arm direct-mode receive after every completed read. The previous
-    // DIO1 action was intentionally detached before readData(), so this call
-    // also installs a fresh ISR and clears stale direct-receive state.
-    setHealthStage("pocsag.rearm");
-    delay(5);
-    int16_t restartState = startReceiver();
-    rxRestartCount++;
-    lastRxState = restartState;
-    Serial.printf("[POCSAG RX] re-arm #%lu -> %d\n", (unsigned long)rxRestartCount, restartState);
-    if (restartState != RADIOLIB_ERR_NONE) {
-      addDebugLog("POCSAG", "RX re-arm failed: " + String(restartState));
-    }
+  } else if (!receiverRunning) {
+    // A TX or explicit RX restart invalidates any pending collect state.
+    pocsagRxPending = false;
+    pocsagPendingSinceMs = 0;
+    pocsagPendingRssi = 0.0f;
+    pocsagLastObservedBytes = 0;
+    pocsagLastLoggedBytes = 0;
   }
 
   if (displayAvailable && millis() - lastDisplayUpdate > 3000) drawDisplay();
